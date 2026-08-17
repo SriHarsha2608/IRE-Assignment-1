@@ -1,23 +1,34 @@
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  temp_dir: /tmp/ire_rec
+
+downloads:
+  MIND: https://huggingface.co/datasets/yjw1029/MIND/resolve/main
+  EB-NeRD: https://ebnerd-dataset.s3.eu-west-1.amazonaws.com
+
 dataset_defaults:
   MIND:
-    root: data/raw/MIND
-    splits: [train, dev]
-    files:
-      train: MINDsmall_train.zip
-      dev: MINDsmall_dev.zip
+    version: MINDsmall
+    archives: [MINDsmall_train.zip, MINDsmall_dev.zip]
   EB-NeRD:
-    root: data/raw/EB-NeRD
-    splits: [train, validation]
-    files:
+    version: "2024"
+    bundles: [demo, small]
+    archives:
       demo: ebnerd_demo.zip
       small: ebnerd_small.zip
-      word2vec: Ekstra_Bladet_word2vec.zip
-      bert: google_bert_base_multilingual_cased.zip
+    embeddings:
+      word2vec: artifacts/Ekstra_Bladet_word2vec.zip
+      bert: artifacts/google_bert_base_multilingual_cased.zip
 
 temporal_split:
-  # last N days -> test, preceding M days -> validation
+  method: days
   val_days: 2
   test_days: 2
+  fallback_ratios: [0.8, 0.1, 0.1]
+
+history:
+  size: 50
 
 retrieval:
   bm25:

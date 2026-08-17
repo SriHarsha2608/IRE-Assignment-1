@@ -38,18 +38,39 @@ IRE-Assignment-1/
 ## Quick start
 
 ```bash
+python3 -m venv .venv && source .venv/bin/activate   # one-time
 pip install -r requirements.txt
-make data          # download + parse + temporal split + feature store (Q1)
+pip install -e .                                      # installs the ire_rec package (src/)
+make data          # Q1: download -> parse -> temporal split -> feature store (--rebuild)
+make pipeline      # re-run quickly; skips everything already up to date
+make test          # unit + no-future-click-leakage tests
+```
+
+Subset selection and safe flags:
+
+```bash
+python -m ire_rec.build_pipeline --datasets MIND,EB-NeRD-demo
+python -m ire_rec.build_pipeline --rebuild --skip-embeddings   # rebuild without the heavy BERT consolidation
 ```
 
 ## Deliverables map (Q1-Q9)
 
 | Q | Item | Location |
 |---|------|----------|
-| Q1 | Reproducible data pipeline | `make data` -> `src/ire_rec/` |
+| Q1 | Reproducible data pipeline | `make data` -> `src/ire_rec/build_pipeline.py`, `datasets/`, `split.py`, `dataio.py` |
 | Q2 | BM25 lexical retrieval | `src/ire_rec/retrieval/bm25.py` |
 | Q3 | Embedding/semantic retrieval | `src/ire_rec/retrieval/semantic.py` |
 | Q4 | Evaluation harness | `src/ire_rec/evaluation/` |
 | Q5 | Codabench submissions | `predictions/` |
 | Q6 | Design note (<=4 pages) | `report/design_note.pdf` |
 | Q7-Q9 | Policies | see spec; leakage test in `tests/` |
+
+## Q1 feature store layout
+
+```
+data/processed/                      # gitignored (Q8)
+├── manifest.json                    # pipeline version, raw fingerprints, split boundaries, counts
+├── MIND/                            # articles / impressions(with split) / history / embeddings(entity_mean)
+├── EB-NeRD-demo/  EB-NeRD-small/    # articles / impressions / history per bundle
+└── EB-NeRD/embeddings/              # shared w2v.npy & bert.npy + *_ids.parquet (dense matrix + id order)
+```
