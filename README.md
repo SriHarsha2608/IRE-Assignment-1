@@ -1,1 +1,55 @@
-# IRE-Assignment-1
+# IRE Assignment 1 - Lexical & Semantic Retrieval on EB-NeRD and MIND
+
+CS4.406 Information Retrieval & Extraction - Assignment 1
+
+## Overview
+
+Recommendation/retrieval foundation pipeline on two news datasets:
+- **MIND** (English, Microsoft News)
+- **EB-NeRD** (Danish, Ekstra Bladet / RecSys 2024)
+
+Pipeline: reproducible data pipeline -> lexical (BM25) and semantic (embeddings + ANN)
+candidate generation -> offline evaluation harness (AUC, MRR, nDCG@5/10, diversity,
+novelty, coverage, sliced + bootstrap CI).
+
+## Structure
+
+```
+IRE-Assignment-1/
+├── Assignment1_v1.pdf        # assignment spec
+├── Makefile                  # one-command entry points
+├── requirements.txt          # python deps
+├── .gitignore                # excludes large files / data (per Q8 policy)
+├── configs/                  # dataset / run configurations
+├── data/
+│   └── raw/                  # raw downloads (gitignored)
+│       ├── MIND/             # MINDsmall_train/dev.zip
+│       └── EB-NeRD/          # ebnerd_demo/small.zip + embeddings
+├── libs/
+│   └── ebnerd-benchmark/     # EB-NeRD starter code (ebrec package)
+├── src/
+│   └── ire_rec/              # our pipeline code (Q1-Q4)
+├── tests/                    # incl. no-future-click-leakage test (Q9)
+├── notebooks/                # exploratory analysis / experiments
+├── predictions/              # Codabench submission files (Q5)
+└── report/                   # design note (Q6)
+```
+
+## Quick start
+
+```bash
+pip install -r requirements.txt
+make data          # download + parse + temporal split + feature store (Q1)
+```
+
+## Deliverables map (Q1-Q9)
+
+| Q | Item | Location |
+|---|------|----------|
+| Q1 | Reproducible data pipeline | `make data` -> `src/ire_rec/` |
+| Q2 | BM25 lexical retrieval | `src/ire_rec/retrieval/bm25.py` |
+| Q3 | Embedding/semantic retrieval | `src/ire_rec/retrieval/semantic.py` |
+| Q4 | Evaluation harness | `src/ire_rec/evaluation/` |
+| Q5 | Codabench submissions | `predictions/` |
+| Q6 | Design note (<=4 pages) | `report/design_note.pdf` |
+| Q7-Q9 | Policies | see spec; leakage test in `tests/` |

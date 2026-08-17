@@ -1,0 +1,36 @@
+dataset_defaults:
+  MIND:
+    root: data/raw/MIND
+    splits: [train, dev]
+    files:
+      train: MINDsmall_train.zip
+      dev: MINDsmall_dev.zip
+  EB-NeRD:
+    root: data/raw/EB-NeRD
+    splits: [train, validation]
+    files:
+      demo: ebnerd_demo.zip
+      small: ebnerd_small.zip
+      word2vec: Ekstra_Bladet_word2vec.zip
+      bert: google_bert_base_multilingual_cased.zip
+
+temporal_split:
+  # last N days -> test, preceding M days -> validation
+  val_days: 2
+  test_days: 2
+
+retrieval:
+  bm25:
+    top_k: [50, 100, 200]
+    field: title_abstract
+  semantic:
+    top_k: [50, 100, 200]
+    user_repr: mean_pool
+    ann: faiss
+
+evaluation:
+  metrics: [auc, mrr, ndcg@5, ndcg@10]
+  beyond_accuracy: [intra_list_diversity, novelty, coverage]
+  slices: [cold_start_vs_warm]
+  bootstrap_runs: 1000
+  bootstrap_seed: 42

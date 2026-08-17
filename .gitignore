@@ -1,0 +1,31 @@
+# ---- Assignment policy (Q8): no large files in Git ----
+*.zip
+*.pt
+*.ckpt
+*.parquet
+*.bin
+*.vec
+*.tar
+*.gz
+
+# ---- Data ----
+data/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- Tooling caches ----
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.huggingface/
+
+# ---- Notebooks / outputs ----
+predictions/*.csv
+report/*.png
