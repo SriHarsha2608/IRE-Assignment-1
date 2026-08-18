@@ -6,6 +6,7 @@ import numpy as np
 import polars as pl
 import pytest
 
+from ire_rec.dataio import add_popularity
 from ire_rec.datasets import ebnerd, mind
 from ire_rec.split import add_temporal_split
 
@@ -106,6 +107,8 @@ def test_temporal_split_fallback():
     )
     out, bounds = add_temporal_split(df, val_days=2, test_days=2)
     assert bounds["method"] == "fallback_proportional"
+    assert bounds["b_val_start"] is None
+    assert bounds["b_test_start"] is None
     counts = {s: out.filter(pl.col("split") == s).height for s in ("train", "val", "test")}
     assert counts["train"] == 8 and counts["val"] == 1 and counts["test"] == 1
     all_splits = out.sort("impression_time")["split"].to_list()
@@ -176,3 +179,88 @@ def test_ebnerd_history_capped(tmp_path):
     imp, _ = ebnerd.parse_ebnerd_behaviors(b, h, history_size=1)
     rows = imp.sort("impression_id").to_dicts()
     assert rows[1]["history"] == ["101"]
+
+
+HISTORY_SCHEMA = [
+    "user_id",
+    "impression_id",
+    "impression_time",
+    "article_id",
+    "click_time",
+    "read_time",
+    "recency",
+]
+
+
+def test_history_schema_unified(tmp_path):
+    imp_m = pl.DataFrame(
+        {
+            "user_id": ["U1", "U2"],
+            "impression_id": ["I1", "I2"],
+            "impression_time": [dt.datetime(2019, 11, 15, 12), dt.datetime(2019, 11, 15, 13)],
+            "history": [["N1", "N2"], None],
+        }
+    )
+    hm = mind.build_mind_history(imp_m)
+    b, h = _write_ebnerd_inputs(tmp_path)
+    _, he = ebnerd.parse_ebnerd_behaviors(b, h, history_size=2)
+
+    assert hm.columns == HISTORY_SCHEMA
+    assert he.columns == HISTORY_SCHEMA
+    assert [str(d) for d in hm.dtypes] == [str(d) for d in he.dtypes]
+    assert hm["impression_time"].to_list() == [dt.datetime(2019, 11, 15, 12)] * 2
+    assert (he["click_time"] < he["impression_time"]).all()
+
+
+def test_mind_cold_start_history_empty(tmp_path):
+    p = tmp_path / "cold.tsv"
+    p.write_text("I1\tU1\t11/15/2019 12:37:50 PM\t\tN1-1 N2-0\n")
+    df = mind.parse_mind_behaviors(p)
+    assert df["history"].to_list() == [[]]
+
+
+def test_ebnerd_impression_before_first_click_is_cold_start(tmp_path):
+    behaviors = pl.DataFrame(
+        {
+            "impression_id": [1],
+            "user_id": [30],
+            "impression_time": [dt.datetime(2023, 5, 1, 10)],
+            "article_ids_inview": [["a", "b"]],
+            "article_ids_clicked": [["a"]],
+            "device_type": [1],
+            "is_sso_user": [True],
+            "is_subscriber": [False],
+            "gender": [0],
+            "age": [20],
+        }
+    )
+    history = pl.DataFrame(
+        {
+            "user_id": [30],
+            "impression_time_fixed": [[dt.datetime(2023, 5, 1, 11)]],
+            "article_id_fixed": [[100]],
+            "read_time_fixed": [[5.0]],
+        }
+    )
+    b = tmp_path / "b.parquet"
+    h = tmp_path / "h.parquet"
+    behaviors.write_parquet(b)
+    history.write_parquet(h)
+    imp, _ = ebnerd.parse_ebnerd_behaviors(b, h, history_size=50)
+    assert imp["history"].to_list() == [[]]
+
+
+def test_add_popularity_train_only():
+    articles = pl.DataFrame({"article_id": ["A", "B", "C"]})
+    impressions = pl.DataFrame(
+        {
+            "inview": [["A", "B"], ["B", "C"]],
+            "labels": [[1, 0], [0, 1]],
+            "split": ["train", "test"],
+        }
+    )
+    feat = add_popularity(articles, impressions)
+    got = {r["article_id"]: r for r in feat.to_dicts()}
+    assert got["A"]["n_inviews"] == 1 and got["A"]["n_clicks"] == 1
+    assert got["B"]["n_inviews"] == 1 and got["B"]["n_clicks"] is None
+    assert got["C"]["n_inviews"] is None and got["C"]["n_clicks"] is None

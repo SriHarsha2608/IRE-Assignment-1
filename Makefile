@@ -1,4 +1,4 @@
-PY := $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python)
+PY := $(shell [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3)
 
 .PHONY: install data pipeline lexical semantic eval predict test clean
 

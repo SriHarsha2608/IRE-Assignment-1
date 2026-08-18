@@ -56,15 +56,16 @@ def load_manifest(path: Path) -> dict[str, Any]:
 
 
 def add_popularity(articles: pl.DataFrame, impressions: pl.DataFrame) -> pl.DataFrame:
+    train = impressions.filter(pl.col(SPLIT) == SPLITS[0])
     inv = (
-        impressions.select(pl.col(INVIEW))
-        .explode(INVIEW)
+        train.select(pl.col(INVIEW))
+        .explode(INVIEW, empty_as_null=True)
         .group_by(INVIEW)
         .agg(pl.len().alias(N_INVIEWS))
     )
     clk = (
-        impressions.select(pl.col(INVIEW), pl.col(LABELS))
-        .explode([INVIEW, LABELS])
+        train.select(pl.col(INVIEW), pl.col(LABELS))
+        .explode([INVIEW, LABELS], empty_as_null=True)
         .filter(pl.col(LABELS) == 1)
         .group_by(INVIEW)
         .agg(pl.len().alias(N_CLICKS))

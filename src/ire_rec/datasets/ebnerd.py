@@ -18,6 +18,7 @@ from ..dataio import (
     IMPRESSION_TIME,
     INVIEW,
     LABELS,
+    PUBLISHED_TIME,
     READ_TIME,
     RECENCY,
     SUBCATEGORY,
@@ -73,7 +74,7 @@ def parse_ebnerd_articles(path: Path) -> pl.DataFrame:
                 BODY,
                 CATEGORY,
                 SUBCATEGORY,
-                "published_time",
+                PUBLISHED_TIME,
                 URL,
                 ENTITIES,
                 ENTITY_IDS,
@@ -90,7 +91,7 @@ def _make_labels(df: pl.DataFrame, clicked: pl.Expr) -> pl.DataFrame:
         df.with_row_index(ridx)
         .with_columns(clicked.alias("_clicked"))
         .select(ridx, INVIEW, "_clicked")
-        .explode(INVIEW)
+        .explode(INVIEW, empty_as_null=True)
         .with_columns(
             pl.col(INVIEW).is_in(pl.col("_clicked")).cast(pl.Int8).alias(LABELS)
         )
@@ -133,12 +134,17 @@ def parse_ebnerd_behaviors(
 
     history = pl.read_parquet(history_path)
     if history.height == 0:
+        size = impressions.height
+        impressions = impressions.with_columns(
+            pl.Series(HISTORY, [[] for _ in range(size)], dtype=pl.List(pl.String))
+        )
         return impressions, pl.DataFrame(
             schema={
                 USER_ID: pl.String,
                 IMPRESSION_ID: pl.String,
-                CLICK_TIME: pl.Datetime("us"),
+                IMPRESSION_TIME: pl.Datetime("us"),
                 ARTICLE_ID: pl.String,
+                CLICK_TIME: pl.Datetime("us"),
                 READ_TIME: pl.Float32,
                 RECENCY: pl.Float64,
             }
@@ -154,11 +160,13 @@ def _compute_per_impression_history(
     imp_t = impressions[IMPRESSION_TIME].cast(pl.Int64).to_numpy()
     imp_u = impressions[USER_ID].to_numpy()
     iid = impressions[IMPRESSION_ID].to_list()
+    imp_dt = impressions[IMPRESSION_TIME].to_list()
     n = len(imp_t)
 
-    history_col: list[list[str] | None] = [None] * n
+    history_col: list[list[str]] = [[] for _ in range(n)]
     long_u: list[str] = []
     long_i: list[str] = []
+    long_im: list[object] = []
     long_a: list[str] = []
     long_t: list[int] = []
     long_r: list[float] = []
@@ -167,7 +175,10 @@ def _compute_per_impression_history(
     for part in history.partition_by(USER_ID, as_dict=False):
         u_str = str(part[USER_ID][0])
         ex = (
-            part.explode(["impression_time_fixed", "article_id_fixed", "read_time_fixed"])
+            part.explode(
+                ["impression_time_fixed", "article_id_fixed", "read_time_fixed"],
+                empty_as_null=True,
+            )
             .drop_nulls("article_id_fixed")
         )
         ct = ex["impression_time_fixed"].cast(pl.Int64).to_numpy()
@@ -188,6 +199,7 @@ def _compute_per_impression_history(
             history_col[ai] = ca[s:k]
             long_u.extend([u_str] * take)
             long_i.extend([iid[ai]] * take)
+            long_im.extend([imp_dt[ai]] * take)
             long_a.extend(ca[s:k])
             long_t.extend(ct[s:k].tolist())
             long_r.extend(cr[s:k].tolist())
@@ -198,10 +210,11 @@ def _compute_per_impression_history(
     )
     history_long = pl.DataFrame(
         {
-            USER_ID: long_u,
-            IMPRESSION_ID: long_i,
-            ARTICLE_ID: long_a,
-            CLICK_TIME: pl.Series(long_t).cast(pl.Datetime("us")),
+            USER_ID: pl.Series(long_u, dtype=pl.String),
+            IMPRESSION_ID: pl.Series(long_i, dtype=pl.String),
+            IMPRESSION_TIME: pl.Series(long_im, dtype=pl.Datetime("us")),
+            ARTICLE_ID: pl.Series(long_a, dtype=pl.String),
+            CLICK_TIME: pl.Series(long_t, dtype=pl.Int64).cast(pl.Datetime("us")),
             READ_TIME: pl.Series(long_r, dtype=pl.Float32),
             RECENCY: pl.Series(long_rec, dtype=pl.Float64) / 1_000_000.0,
         }

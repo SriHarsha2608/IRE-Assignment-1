@@ -13,7 +13,7 @@ from .datasets import ebnerd, mind
 from .utils import clean_dir, find_file, unzip
 
 log = logging.getLogger(__name__)
-VERSION = "1"
+VERSION = "2"
 
 EMBEDDINGS_KEY = "EB-NeRD-embeddings"
 
@@ -58,11 +58,23 @@ def build_mind(cfg: dict, force: bool, redownload: bool) -> dict:
     emb_parts = []
     for arch in archives:
         root = tmp / arch.replace(".zip", "")
-        d = find_file(root, "news.tsv").parent
-        news_parts.append(mind.parse_mind_news(d / "news.tsv"))
-        beh_parts.append(mind.parse_mind_behaviors(d / "behaviors.tsv"))
-        vec, ids = mind.parse_entity_embeddings(d / "entity_embedding.vec")
-        emb_parts.append(dict(zip(ids, vec)))
+        news_tsv = find_file(root, "news.tsv")
+        if news_tsv is None:
+            raise FileNotFoundError(f"news.tsv not found in {arch}")
+        beh_tsv = find_file(root, "behaviors.tsv")
+        if beh_tsv is None:
+            raise FileNotFoundError(f"behaviors.tsv not found in {arch}")
+        news_parts.append(mind.parse_mind_news(news_tsv))
+        beh_parts.append(mind.parse_mind_behaviors(beh_tsv))
+        vec_file = find_file(root, "entity_embedding.vec")
+        if vec_file is not None:
+            vec, ids = mind.parse_entity_embeddings(vec_file)
+            emb_parts.append(dict(zip(ids, vec)))
+        else:
+            log.warning(
+                "entity_embedding.vec missing in %s (entity vectors skipped for this archive)",
+                arch,
+            )
 
     articles = pl.concat(news_parts).unique(subset=dataio.ARTICLE_ID, keep="first")
     impressions = pl.concat(beh_parts)
@@ -75,9 +87,15 @@ def build_mind(cfg: dict, force: bool, redownload: bool) -> dict:
     )
     articles = dataio.add_popularity(articles, impressions)
 
-    entity = {}
-    for d in emb_parts:
-        entity.update(d)
+    entity: dict[str, np.ndarray] = {}
+    for part in emb_parts:
+        for eid, vec in part.items():
+            if eid in entity and not np.array_equal(entity[eid], vec):
+                log.warning(
+                    "entity %s has conflicting vectors across archives; keeping first",
+                    eid,
+                )
+            entity.setdefault(eid, vec)
     entity_ids = list(entity)
     arr = np.asarray(list(entity.values()), dtype=np.float32)
     emb_mat, emb_ids = mind.build_entity_article_embeddings(arr, entity_ids, articles)
@@ -222,6 +240,13 @@ def main() -> None:
 
     manifest_path = config.processed_dir(cfg) / "manifest.json"
     manifest = dataio.load_manifest(manifest_path)
+    if manifest.get("version") != VERSION:
+        log.info(
+            "manifest version %s != current %s; treating store as stale",
+            manifest.get("version"),
+            VERSION,
+        )
+        manifest = {}
     manifest.setdefault("version", VERSION)
     started = time.time()
 

@@ -1,7 +1,7 @@
 paths:
   raw_dir: data/raw
   processed_dir: data/processed
-  temp_dir: /tmp/ire_rec
+  temp_dir: data/tmp
 
 downloads:
   MIND: https://huggingface.co/datasets/yjw1029/MIND/resolve/main

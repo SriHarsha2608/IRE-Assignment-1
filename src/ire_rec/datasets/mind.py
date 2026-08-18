@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
 import polars as pl
+
+log = logging.getLogger(__name__)
 
 from ..dataio import (
     ABSTRACT,
     ARTICLE_ID,
     BODY,
     CATEGORY,
+    CLICK_TIME,
     ENTITIES,
     ENTITY_IDS,
     HISTORY,
@@ -19,6 +23,8 @@ from ..dataio import (
     INVIEW,
     LABELS,
     PUBLISHED_TIME,
+    READ_TIME,
+    RECENCY,
     SUBCATEGORY,
     TITLE,
     URL,
@@ -115,7 +121,7 @@ def parse_mind_behaviors(path: Path) -> pl.DataFrame:
     )
     parsed = pl.struct(["history", "impressions"]).map_elements(
         lambda r: {
-            "history": r["history"].split() if r["history"] else None,
+            "history": r["history"].split() if r["history"] else [],
             **_parse_impressions(r["impressions"]),
         },
         return_dtype=pl.Struct(
@@ -128,6 +134,7 @@ def parse_mind_behaviors(path: Path) -> pl.DataFrame:
     )
     t_sec = pl.col("time").str.to_datetime("%m/%d/%Y %I:%M:%S %p", strict=False)
     t_min = pl.col("time").str.to_datetime("%m/%d/%Y %I:%M %p", strict=False)
+    n_before = df.height
     out = (
         df.with_columns(
             pl.coalesce(t_sec, t_min).alias(IMPRESSION_TIME),
@@ -148,6 +155,9 @@ def parse_mind_behaviors(path: Path) -> pl.DataFrame:
         )
         .drop_nulls(IMPRESSION_TIME)
     )
+    dropped = n_before - out.height
+    if dropped:
+        log.warning("dropped %d MIND behavior rows with unparseable time", dropped)
     return out
 
 
@@ -176,7 +186,7 @@ def build_entity_article_embeddings(
     for article_id, entity_ids in zip(
         articles[ARTICLE_ID].to_list(), articles[ENTITY_IDS].to_list()
     ):
-        embs = [lookup[e] for e in entity_ids if e in lookup]
+        embs = [lookup[e] for e in (entity_ids or []) if e in lookup]
         if embs:
             matrix.append(np.mean(embs, axis=0))
             covered.append(article_id)
@@ -187,9 +197,24 @@ def build_entity_article_embeddings(
 
 def build_mind_history(impressions: pl.DataFrame) -> pl.DataFrame:
     return (
-        impressions.select([IMPRESSION_ID, USER_ID, IMPRESSION_TIME, HISTORY])
-        .explode(HISTORY)
+        impressions.select([USER_ID, IMPRESSION_ID, IMPRESSION_TIME, HISTORY])
+        .explode(HISTORY, empty_as_null=True)
         .rename({HISTORY: ARTICLE_ID})
         .drop_nulls(ARTICLE_ID)
-        .with_columns(pl.lit(None, dtype=pl.Datetime("us")).alias("click_time"))
+        .with_columns(
+            pl.lit(None, dtype=pl.Datetime("us")).alias(CLICK_TIME),
+            pl.lit(None, dtype=pl.Float32).alias(READ_TIME),
+            pl.lit(None, dtype=pl.Float64).alias(RECENCY),
+        )
+        .select(
+            [
+                USER_ID,
+                IMPRESSION_ID,
+                IMPRESSION_TIME,
+                ARTICLE_ID,
+                CLICK_TIME,
+                READ_TIME,
+                RECENCY,
+            ]
+        )
     )

@@ -57,8 +57,8 @@ def add_temporal_split(
     boundaries = {
         "method": method,
         "min_time": tmin,
-        "b_val_start": b_val,
-        "b_test_start": b_test,
+        "b_val_start": b_val if method == "days" else None,
+        "b_test_start": b_test if method == "days" else None,
         "max_time": tmax,
         "counts": counts,
     }

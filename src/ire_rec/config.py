@@ -27,4 +27,4 @@ def processed_dir(config: dict[str, Any]) -> Path:
 
 
 def temp_dir(config: dict[str, Any]) -> Path:
-    return Path(config["paths"]["temp_dir"])
+    return repo_root() / config["paths"]["temp_dir"]
