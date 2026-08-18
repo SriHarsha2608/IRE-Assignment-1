@@ -33,7 +33,12 @@ history:
 retrieval:
   bm25:
     top_k: [50, 100, 200]
-    field: title_abstract
+    field: title_abstract   # corpus field: title | abstract | title_abstract
+    query_field: title      # query field: title | title_abstract
+    history_query_cap: 20   # most-recent clicks concatenated into the query
+    k1: 1.5
+    b: 0.75
+    remove_stopwords: true
   semantic:
     top_k: [50, 100, 200]
     user_repr: mean_pool
