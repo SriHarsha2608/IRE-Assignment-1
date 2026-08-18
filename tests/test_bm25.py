@@ -21,9 +21,9 @@ def test_tokenize_english_and_stopwords():
 
 def test_bm25_index_returns_most_similar_doc_first():
     corpus = [
-        "the cat sat on the mat".split(),
-        "the dog ran after the ball".split(),
-        "global climate change report released".split(),
+        tokenize("the cat sat on the mat"),
+        tokenize("the dog ran after the ball"),
+        tokenize("global climate change report released"),
     ]
     index = Bm25Index(corpus)
     scores, idx = index.search("cat mat", top_k=2)
@@ -33,9 +33,25 @@ def test_bm25_index_returns_most_similar_doc_first():
 
 
 def test_bm25_empty_query_returns_empty():
-    index = Bm25Index(["hello world".split()])
+    index = Bm25Index([tokenize("hello world")])
     scores, idx = index.search("", top_k=5)
     assert scores.size == 0 and idx.size == 0
+
+
+def test_negative_idf_is_floored_to_epsilon():
+    rare = ["alpha"]
+    common = "beta"
+    # beta appears in every doc -> raw idf negative (freq > N - freq + 1);
+    # without the epsilon floor a query term would drive scores DOWN.
+    corpus = [rare + [common]] + [[common] for _ in range(9)]
+    index = Bm25Index(corpus)
+    assert index.postings[common]
+    assert index.idf["beta"] >= 0
+
+    score_alone, _ = index.search(["alpha"], top_k=10)
+    score_plus, idx_plus = index.search(["alpha", "beta"], top_k=10)
+    hits = {int(d): float(s) for s, d in zip(score_plus, idx_plus)}
+    assert hits[0] >= float(score_alone[0])
 
 
 def test_build_query_from_history_caps_and_uses_titles():

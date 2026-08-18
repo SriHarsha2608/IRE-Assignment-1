@@ -18,7 +18,7 @@ _EN_STOPWORDS = {
     "not", "of", "on", "one", "or", "our", "out", "s", "she", "so", "some",
     "t", "than", "that", "the", "their", "them", "then", "there", "these",
     "they", "this", "those", "to", "up", "us", "was", "we", "were", "what",
-    "when", "where", "which", "who", "will", "with", "you", "your", "its",
+    "when", "where", "which", "who", "will", "with", "you", "your",
 }
 
 _DA_STOPWORDS = {
@@ -61,7 +61,11 @@ class Bm25Index:
     Args:
         corpus: iterable of token lists (one per document).
         k1, b: BM25 hyper-parameters.
-        epsilon: idf floor; idf = ln((N - df + 0.5) / (df + 0.5)) + 1.
+        epsilon: idf floor for terms whose raw idf is negative
+            (idf = ln((N - df + 0.5) / (df + 0.5)) + 1; if that value is
+            negative, it is floored to ``epsilon * average_idf``, the same
+            ATIRE floor rank-bm25 applies, so that a query term can never
+            *decrease* a document's score).
     """
 
     def __init__(
@@ -89,8 +93,15 @@ class Bm25Index:
         n = self.corpus_size
         self.idf: dict[str, float] = {}
         self.postings: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        raw = {
+            term: log((n - df[term] + 0.5) / (df[term] + 0.5)) + 1
+            for term in post
+        }
+        average_idf = sum(raw.values()) / len(raw) if raw else 0.0
+        eps = self.epsilon * average_idf
         for term, pairs in post.items():
-            self.idf[term] = log((n - df[term] + 0.5) / (df[term] + 0.5)) + 1
+            idf_raw = raw[term]
+            self.idf[term] = idf_raw if idf_raw >= 0 else eps
             arr = np.asarray(pairs, dtype=np.int32)
             self.postings[term] = (arr[:, 0], arr[:, 1])
 
@@ -177,6 +188,11 @@ def build_query_from_history(
     if not history_articles:
         return ""
     if query_texts is None:
+        if articles is None:
+            raise ValueError(
+                "build_query_from_history: pass either query_texts or articles "
+                "(both are None)"
+            )
         query_texts = build_query_texts(articles, field=field)
     texts = []
     for aid in history_articles[-cap:]:

@@ -24,6 +24,7 @@ from .bm25 import (
     build_query_from_history,
     build_query_texts,
     recall_at_k,
+    tokenize,
 )
 
 log = logging.getLogger(__name__)
@@ -35,6 +36,10 @@ def _candidates_dir(cfg: dict, dataset: str) -> Path:
 
 def _gt_clicked(labels, inview):
     """Ground-truth clicked articles for an impression's inview list."""
+    if len(labels) != len(inview):
+        raise ValueError(
+            f"inview/labels length mismatch: {len(inview)} vs {len(labels)}"
+        )
     return [aid for aid, lab in zip(inview, labels) if lab == 1]
 
 
@@ -109,7 +114,7 @@ def run_bm25(
                 "gt_clicked": _gt_clicked(row[LABELS], row[INVIEW]),
                 "candidates": candidates,
                 "scores": scores.tolist(),
-                "n_query_terms": len(query.split()),
+                "n_query_terms": len(tokenize(query)),
             }
         )
 
@@ -167,8 +172,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--top-k",
-        default="50,100,200",
-        help="comma-separated K values",
+        default=None,
+        help="comma-separated K values (default: retrieval.bm25.top_k in config)",
     )
     parser.add_argument("--limit", type=int, default=None, help="cap impressions (debug)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -179,7 +184,11 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
     cfg = load_config()
-    top_k = [int(x.strip()) for x in args.top_k.split(",")]
+    top_k = (
+        [int(x.strip()) for x in args.top_k.split(",")]
+        if args.top_k
+        else [int(k) for k in cfg["retrieval"]["bm25"].get("top_k", [50, 100, 200])]
+    )
     splits = tuple(x.strip() for x in args.splits.split(","))
     for dataset in args.datasets.split(","):
         summary = run_bm25(cfg, dataset.strip(), top_k, splits, limit=args.limit)
