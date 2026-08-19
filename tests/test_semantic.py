@@ -230,24 +230,173 @@ def test_fair_compare_intersects_on_common_impressions(tmp_path):
     def _write(d: Path, rows):
         pl.DataFrame(
             {
-                "impression_id": [r[0] for r in rows],
+                "impression_row_id": [r[0] for r in rows],
+                "impression_id": [r[1] for r in rows],
                 "split": ["val"] * len(rows),
-                "gt_clicked": [r[1] for r in rows],
-                "candidates": [r[2] for r in rows],
+                "gt_clicked": [r[2] for r in rows],
+                "candidates": [r[3] for r in rows],
                 "scores": [[0.0]] * len(rows),
             }
         ).write_parquet(d / "candidates_val.parquet")
 
     covered = {"a", "b", "c"}
-    # semantic file: I1 (covered GT), I4 (covered GT), I2 (uncovered GT)
-    _write(sem_dir, [("I1", ["a"], ["a"]), ("I4", ["a"], ["a"]), ("I2", ["d"], ["d"])])
-    # bm25 file: I1, I2, and I5 (I4 missing, I5 extra -> only {I1, I2} in common)
-    _write(bm25_dir, [("I1", ["a"], ["a"]), ("I2", ["d"], ["d"]), ("I5", ["a"], ["a"])])
+    # semantic file: rid 0 (covered GT), rid 3 (covered GT), rid 1 (uncovered GT)
+    _write(
+        sem_dir,
+        [
+            (0, "I1", ["a"], ["a"]),
+            (3, "I4", ["a"], ["a"]),
+            (1, "I2", ["d"], ["d"]),
+        ],
+    )
+    # bm25 file: rid 0, rid 1, rid 4 (rid 3 missing, rid 4 extra -> {0, 1} common)
+    _write(
+        bm25_dir,
+        [
+            (0, "I1", ["a"], ["a"]),
+            (1, "I2", ["d"], ["d"]),
+            (4, "I5", ["a"], ["a"]),
+        ],
+    )
 
     out = _fair_compare(bm25_dir, sem_dir, covered, catalog_n=4, top_k=[50])
     entry = out["splits"]["val"]
-    assert entry["n_gt_nonempty"] == 2        # common impressions {I1, I2}
-    assert entry["n_fair"] == 1               # only I1 is gt-covered in common
+    assert entry["n_gt_nonempty"] == 2        # common impression rows {0, 1}
+    assert entry["n_fair"] == 1               # only rid 0 is gt-covered in common
     assert entry["n_fair_bm"] == 1
     assert entry["semantic"]["recall@50"] == 1.0
     assert entry["bm25"]["recall@50"] == 1.0
+
+
+def test_fair_compare_duplicate_impression_ids(tmp_path):
+    """Duplicate impression_id rows must be aligned by row identity.
+
+    MIND reuses some impression_id values for distinct rows.  Aligning on
+    impression_id would conflate them; the fair comparison must use the
+    row-level impression_row_id so both rows stay distinct and --limit cannot
+    accidentally align the wrong duplicate row.
+    """
+    from ire_rec.retrieval.run_semantic import _fair_compare
+
+    bm25_dir = tmp_path / "bm25"
+    sem_dir = tmp_path / "sem"
+    bm25_dir.mkdir()
+    sem_dir.mkdir()
+
+    def _write(d: Path, rows):
+        pl.DataFrame(
+            {
+                "impression_row_id": [r[0] for r in rows],
+                "impression_id": [r[1] for r in rows],
+                "split": ["val"] * len(rows),
+                "gt_clicked": [r[2] for r in rows],
+                "candidates": [r[3] for r in rows],
+                "scores": [[0.0]] * len(rows),
+            }
+        ).write_parquet(d / "candidates_val.parquet")
+
+    covered = {"a", "b"}
+    # both rows share impression_id "X" but are genuinely distinct impressions
+    _write(sem_dir, [(0, "X", ["a"], ["a"]), (1, "X", ["b"], ["b"])])
+    _write(bm25_dir, [(0, "X", ["a"], ["a"]), (1, "X", ["b"], ["b"])])
+
+    out = _fair_compare(bm25_dir, sem_dir, covered, catalog_n=2, top_k=[50])
+    entry = out["splits"]["val"]
+    assert entry["n_gt_nonempty"] == 2   # both rows distinct, none silently dropped
+    assert entry["n_fair"] == 2
+    assert entry["n_fair_bm"] == 2
+    assert entry["semantic"]["recall@50"] == 1.0
+    assert entry["bm25"]["recall@50"] == 1.0
+
+    # a --limit semantic run carrying only row 0 must align with BM25's row 0,
+    # NOT with BM25's row 1 (same impression_id "X")
+    _write(sem_dir, [(0, "X", ["a"], ["a"])])
+    out = _fair_compare(bm25_dir, sem_dir, covered, catalog_n=2, top_k=[50])
+    entry = out["splits"]["val"]
+    assert entry["n_gt_nonempty"] == 1
+    assert entry["n_fair"] == 1 and entry["n_fair_bm"] == 1
+    assert entry["semantic"]["recall@50"] == 1.0
+
+
+def test_load_embeddings_ndim_and_finite_validation(tmp_path):
+    emb_dir = tmp_path / "embeddings"
+    emb_dir.mkdir()
+    # 1-D matrix -> error
+    np.save(emb_dir / "x.npy", np.zeros(4, dtype=np.float32))
+    pl.DataFrame({"article_id": ["a", "b", "c", "d"]}).write_parquet(
+        emb_dir / "x_ids.parquet"
+    )
+    with pytest.raises(ValueError, match="ndim"):
+        load_embeddings(emb_dir, "x")
+    # zero embedding dimension -> error
+    np.save(emb_dir / "y.npy", np.zeros((3, 0), dtype=np.float32))
+    pl.DataFrame({"article_id": ["a", "b", "c"]}).write_parquet(
+        emb_dir / "y_ids.parquet"
+    )
+    with pytest.raises(ValueError, match="dimension"):
+        load_embeddings(emb_dir, "y")
+    # non-finite values -> error
+    np.save(emb_dir / "z.npy", np.array([[1.0, np.nan]], dtype=np.float32))
+    pl.DataFrame({"article_id": ["a"]}).write_parquet(emb_dir / "z_ids.parquet")
+    with pytest.raises(ValueError, match="non-finite"):
+        load_embeddings(emb_dir, "z")
+
+
+def test_run_semantic_partial_run_does_not_mix_stale_splits(tmp_path):
+    """Semantic runs must clear stale candidates like run_bm25 does.
+
+    A later --limit run on one split must not keep another split's stale
+    candidates around (they would leak into recall.json / cold-warm /
+    comparison.json).
+    """
+    import json as _json
+
+    from ire_rec.config import load_config
+    from ire_rec.retrieval.run_semantic import run_semantic
+
+    store = tmp_path / "store"
+    emb_dir = tmp_path / "embeddings"
+    emb_dir.mkdir()
+    store.mkdir()
+
+    n = 4
+    mat = np.eye(n, dtype=np.float32)
+    np.save(emb_dir / "w2v.npy", mat)
+    pl.DataFrame({"article_id": [f"a{i}" for i in range(n)]}).write_parquet(
+        emb_dir / "w2v_ids.parquet"
+    )
+    pl.DataFrame({"article_id": [f"a{i}" for i in range(n)]}).write_parquet(
+        store / "articles.parquet"
+    )
+    pl.DataFrame(
+        {
+            "impression_id": ["I1", "I2", "I3"],
+            "user_id": ["U1", "U2", "U3"],
+            "impression_time": [
+                dt.datetime(2023, 1, 1),
+                dt.datetime(2023, 1, 2),
+                dt.datetime(2023, 1, 3),
+            ],
+            "split": ["val", "val", "test"],
+            "history": [["a0"], ["a1"], ["a2"]],
+            "inview": [["a0"], ["a1"], ["a2"]],
+            "labels": [[1], [1], [1]],
+        }
+    ).write_parquet(store / "impressions.parquet")
+
+    cfg = load_config()
+    out_dir = store / "retrieval" / "semantic" / "w2v"
+
+    # full run on test only -> recall.json has test
+    run_semantic(cfg, "SYN", [50], ("test",), embedding="w2v", dset_dir=store, emb_dir=emb_dir)
+    rec = _json.loads((out_dir / "recall.json").read_text())
+    assert set(rec["splits"].keys()) == {"test"}
+
+    # a later partial --limit run on val must not mix the stale test metrics in
+    run_semantic(cfg, "SYN", [50], ("val",), limit=1, embedding="w2v", dset_dir=store, emb_dir=emb_dir)
+    rec = _json.loads((out_dir / "recall.json").read_text())
+    assert set(rec["splits"].keys()) == {"val"}
+    # the stale test candidate file is cleared so nothing stale can be combined
+    assert not (out_dir / "candidates_test.parquet").exists()
+    # the current val file reflects exactly the limited invocation
+    assert pl.read_parquet(out_dir / "candidates_val.parquet").height == 1

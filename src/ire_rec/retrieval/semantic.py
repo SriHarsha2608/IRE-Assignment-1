@@ -20,10 +20,24 @@ def load_embeddings(
     with ``ids`` (row i == article ``ids[i]``) and covers only retrievable
     articles.
 
-    The store is validated: the id list must match the matrix row count and the
-    ids must be unique (duplicates would silently corrupt ``id_to_row`` lookups).
+    The store is validated: the id list must match the matrix row count, the
+    ids must be unique (duplicates would silently corrupt ``id_to_row``
+    lookups), the matrix must be 2-D with a positive embedding dimension, and
+    every value must be finite.
     """
     mat = np.load(emb_dir / f"{name}.npy")
+    if mat.ndim != 2:
+        raise ValueError(
+            f"{name}: embedding matrix has ndim={mat.ndim}, expected a 2-D "
+            "matrix (rows=articles, cols=embedding dim)"
+        )
+    if mat.shape[1] <= 0:
+        raise ValueError(f"{name}: embedding dimension must be > 0, got {mat.shape[1]}")
+    if not np.isfinite(mat).all():
+        raise ValueError(
+            f"{name}: embedding matrix contains non-finite values (NaN/Inf); "
+            "refusing to build an index over corrupt vectors"
+        )
     ids = pl.read_parquet(emb_dir / f"{name}_ids.parquet")[ARTICLE_ID].to_list()
     if len(ids) != mat.shape[0]:
         raise ValueError(

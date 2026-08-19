@@ -13,6 +13,7 @@ from ..dataio import (
     ARTICLE_ID,
     HISTORY,
     IMPRESSION_ID,
+    IMPRESSION_ROW_ID,
     INVIEW,
     LABELS,
     SPLIT,
@@ -87,14 +88,18 @@ def _cold_warm_recall(df: pl.DataFrame, k: int) -> dict:
 
 
 def _semantic_cold_warm(out_dir: Path, k: int) -> dict[str, dict]:
+    """Cold/warm recall@k per split from semantic candidate parquets.
+
+    Rows are already unique per impression row (``impression_row_id`` is
+    unique, unlike ``impression_id`` which MIND reuses across distinct rows),
+    so no deduplication is applied here.
+    """
     out: dict[str, dict] = {}
     for split_file in sorted(out_dir.glob("candidates_*.parquet")):
         sn = split_file.stem.split("_", 1)[1]
         if sn not in ("val", "test"):
             continue
-        df = pl.read_parquet(split_file).unique(
-            subset=IMPRESSION_ID, keep="first"
-        )
+        df = pl.read_parquet(split_file)
         out[sn] = _cold_warm_recall(df, k)
     return out
 
@@ -102,11 +107,10 @@ def _semantic_cold_warm(out_dir: Path, k: int) -> dict[str, dict]:
 def _bm25_cold_warm(bm25_dir: Path, impressions: pl.DataFrame, k: int) -> dict[str, dict]:
     """Cold/warm recall@k from BM25 candidates (join history length).
 
-    Some MIND dev rows reuse the same ``impression_id`` for genuinely distinct
-    impressions, so both sides are deduplicated on ``impression_id`` (keep
-    first) before the join to avoid row multiplication.  The history map is
-    scoped to the split being sliced so ids that also appear in other splits
-    resolve to their own split's history.
+    Both sides are keyed by ``impression_row_id`` (a stable row-level
+    identifier carried in the candidate parquets), so MIND's reused
+    ``impression_id`` values cannot multiply rows or misalign them.  The
+    history map is scoped to the split being sliced.
     """
     out: dict[str, dict] = {}
     for split_file in sorted(bm25_dir.glob("candidates_*.parquet")):
@@ -115,15 +119,10 @@ def _bm25_cold_warm(bm25_dir: Path, impressions: pl.DataFrame, k: int) -> dict[s
             continue
         hist_map = (
             impressions.filter(pl.col(SPLIT) == sn)
-            .select([IMPRESSION_ID, HISTORY])
-            .unique(subset=IMPRESSION_ID, keep="first")
+            .select([IMPRESSION_ROW_ID, HISTORY])
             .with_columns(pl.col(HISTORY).fill_null([]).list.len().alias("n_history"))
         )
-        df = (
-            pl.read_parquet(split_file)
-            .unique(subset=IMPRESSION_ID, keep="first")
-            .join(hist_map, on=IMPRESSION_ID, how="left")
-        )
+        df = pl.read_parquet(split_file).join(hist_map, on=IMPRESSION_ROW_ID, how="left")
         out[sn] = _cold_warm_recall(df, k)
     return out
 
@@ -155,12 +154,13 @@ def _fair_compare(
     difference is reported explicitly via ``coverage``.
 
     Both methods are evaluated on the SAME impression population: candidate
-    files are intersected on ``impression_id`` before the gt-coverage filter,
-    so a partial/--limit run on one side cannot silently change the other
-    side's recall population.  ``n_gt_nonempty`` is the number of distinct
-    common impressions with >=1 click; ``n_fair``/``n_fair_bm`` are the row
-    counts of the gt-covered subset (equal when the two files carry the same
-    rows for the common impressions).
+    files are intersected on ``impression_row_id`` (a stable row-level
+    identifier, since MIND reuses some ``impression_id`` values across distinct
+    rows) before the gt-coverage filter, so a partial/--limit run on one side
+    cannot silently change the other side's recall population.
+    ``n_gt_nonempty`` is the number of common impression rows with >=1 click;
+    ``n_fair``/``n_fair_bm`` are the row counts of the gt-covered subset (equal
+    when the two files carry the same rows for the common impressions).
     """
     out: dict = {
         "coverage": round(len(covered) / catalog_n, 4) if catalog_n else 0.0,
@@ -175,8 +175,8 @@ def _fair_compare(
             "embedding-covered articles. Coverage is reported above so the "
             "smaller semantic candidate universe is not hidden. Recall is "
             "computed on impressions present in BOTH candidate files "
-            "(intersected on impression_id) whose gt_clicked are all "
-            "embedding-covered."
+            "(intersected on the row-level impression_row_id) whose gt_clicked "
+            "are all embedding-covered."
         ),
         "splits": {},
     }
@@ -194,16 +194,16 @@ def _fair_compare(
         sem_df = pl.read_parquet(sem_files[sn]).filter(
             pl.col("gt_clicked").list.len() > 0
         )
-        common = set(sem_df[IMPRESSION_ID].to_list())
+        common = set(sem_df[IMPRESSION_ROW_ID].to_list())
         bm_df = None
         if sn in bm25_files:
             bm_df = pl.read_parquet(bm25_files[sn]).filter(
                 pl.col("gt_clicked").list.len() > 0
             )
-            common &= set(bm_df[IMPRESSION_ID].to_list())
-        # Both methods must be scored on the same impressions: intersect on
-        # impression_id before filtering on gt coverage.
-        sem_df = sem_df.filter(pl.col(IMPRESSION_ID).is_in(common))
+            common &= set(bm_df[IMPRESSION_ROW_ID].to_list())
+        # Both methods must be scored on the same impression ROWS: intersect on
+        # the row-level identifier before filtering on gt coverage.
+        sem_df = sem_df.filter(pl.col(IMPRESSION_ROW_ID).is_in(common))
         fair = sem_df.filter(_gt_all_covered(covered))
         entry: dict = {
             "n_gt_nonempty": len(common),
@@ -211,7 +211,7 @@ def _fair_compare(
             "semantic": {f"recall@{k}": _mean_recall(fair, k) for k in sorted(top_k)},
         }
         if bm_df is not None:
-            fair_bm = bm_df.filter(pl.col(IMPRESSION_ID).is_in(common)).filter(
+            fair_bm = bm_df.filter(pl.col(IMPRESSION_ROW_ID).is_in(common)).filter(
                 _gt_all_covered(covered)
             )
             entry["n_fair_bm"] = int(fair_bm.height)
@@ -272,7 +272,12 @@ def run_semantic(
     t0 = time.time()
     dset_dir = Path(dset_dir) if dset_dir else processed_dir(cfg) / dataset
     articles = read_df(dset_dir / "articles.parquet")
-    impressions = read_df(dset_dir / "impressions.parquet")
+    # Derive a stable row-level identifier from the FULL impressions frame
+    # (before any split filter / --limit) so candidate rows align exactly with
+    # the source impression row -- even when impression_id is reused (MIND dev).
+    impressions = read_df(dset_dir / "impressions.parquet").with_row_index(
+        IMPRESSION_ROW_ID
+    )
 
     default_emb_dir, default_name = _embedding_dir(cfg, dataset, embedding)
     emb_dir = Path(emb_dir) if emb_dir else default_emb_dir
@@ -319,6 +324,7 @@ def run_semantic(
             scores = scores_arr.tolist()
         user_rows.append(
             {
+                IMPRESSION_ROW_ID: row[IMPRESSION_ROW_ID],
                 IMPRESSION_ID: row[IMPRESSION_ID],
                 SPLIT: row[SPLIT],
                 "gt_clicked": _gt_clicked(row[LABELS], row[INVIEW]),
@@ -332,6 +338,7 @@ def run_semantic(
     out = pl.DataFrame(
         user_rows,
         schema={
+            IMPRESSION_ROW_ID: pl.UInt32,
             IMPRESSION_ID: pl.String,
             SPLIT: pl.String,
             "gt_clicked": pl.List(pl.String),
@@ -344,6 +351,13 @@ def run_semantic(
 
     out_dir = dset_dir / "retrieval" / "semantic" / emb_name
     out_dir.mkdir(parents=True, exist_ok=True)
+    # Clear candidate files first so a stale candidates_*.parquet from an
+    # earlier run (e.g. a --limit debug run) can never be mixed with the
+    # current invocation's results: recall.json / cold-warm / comparison.json
+    # always correspond to exactly one coherent run.  Run --splits val,test
+    # together to get both splits.
+    for old in out_dir.glob("candidates*.parquet"):
+        old.unlink()
     for split_name in splits:
         sub = out.filter(pl.col(SPLIT) == split_name)
         if sub.height:
@@ -413,6 +427,8 @@ def main() -> None:
         if args.top_k
         else [int(k) for k in cfg["retrieval"]["semantic"].get("top_k", [50, 100, 200])]
     )
+    if not top_k or any(k <= 0 for k in top_k):
+        parser.error("top_k values must be positive integers")
     splits = tuple(x.strip() for x in args.splits.split(","))
     for dataset in args.datasets.split(","):
         summary = run_semantic(

@@ -13,6 +13,7 @@ from ..dataio import (
     ARTICLE_ID,
     HISTORY,
     IMPRESSION_ID,
+    IMPRESSION_ROW_ID,
     INVIEW,
     LABELS,
     SPLIT,
@@ -80,7 +81,13 @@ def run_bm25(
     t0 = time.time()
     dset_dir = processed_dir(cfg) / dataset
     articles = read_df(dset_dir / "articles.parquet")
-    impressions = read_df(dset_dir / "impressions.parquet")
+    # Derive a stable row-level identifier from the FULL impressions frame
+    # (before any split filter / --limit) so candidate rows can be aligned
+    # exactly with the source impression row -- even when impression_id values
+    # are reused across distinct rows (MIND dev quirk).
+    impressions = read_df(dset_dir / "impressions.parquet").with_row_index(
+        IMPRESSION_ROW_ID
+    )
 
     sel_impr = impressions.filter(pl.col(SPLIT).is_in(splits))
     if limit is not None:
@@ -114,6 +121,7 @@ def run_bm25(
         candidates = [articles[ARTICLE_ID][int(i)] for i in doc_idx]
         user_rows.append(
             {
+                IMPRESSION_ROW_ID: row[IMPRESSION_ROW_ID],
                 IMPRESSION_ID: row[IMPRESSION_ID],
                 SPLIT: row[SPLIT],
                 "gt_clicked": _gt_clicked(row[LABELS], row[INVIEW]),
@@ -126,6 +134,7 @@ def run_bm25(
     out = pl.DataFrame(
         user_rows,
         schema={
+            IMPRESSION_ROW_ID: pl.UInt32,
             IMPRESSION_ID: pl.String,
             SPLIT: pl.String,
             "gt_clicked": pl.List(pl.String),
@@ -196,6 +205,8 @@ def main() -> None:
         if args.top_k
         else [int(k) for k in cfg["retrieval"]["bm25"].get("top_k", [50, 100, 200])]
     )
+    if not top_k or any(k <= 0 for k in top_k):
+        parser.error("top_k values must be positive integers")
     splits = tuple(x.strip() for x in args.splits.split(","))
     for dataset in args.datasets.split(","):
         summary = run_bm25(cfg, dataset.strip(), top_k, splits, limit=args.limit)

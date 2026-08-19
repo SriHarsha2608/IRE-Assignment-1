@@ -209,7 +209,7 @@ def build_query_from_history(
     ``query_texts`` mapping (article_id -> text) for speed; otherwise it is
     derived from ``articles``.
     """
-    if not history_articles:
+    if not history_articles or cap <= 0:
         return ""
     if query_texts is None:
         if articles is None:

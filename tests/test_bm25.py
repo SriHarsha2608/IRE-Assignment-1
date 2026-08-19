@@ -127,6 +127,19 @@ def test_build_query_skips_unknown_articles():
     assert q == "Only"
 
 
+def test_build_query_cap_zero_or_negative_returns_empty():
+    articles = pl.DataFrame(
+        {"article_id": ["A1", "A2"], "title": ["First", "Second"], "abstract": ["", ""]}
+    )
+    texts = build_query_texts(articles, field="title")
+    # cap=0 must NOT select the whole history via history_articles[-0:]
+    assert build_query_from_history(["A1", "A2"], texts, cap=0) == ""
+    # negative caps are rejected the same way
+    assert build_query_from_history(["A1", "A2"], texts, cap=-1) == ""
+    # empty history stays empty regardless of cap
+    assert build_query_from_history([], texts, cap=20) == ""
+
+
 def test_recall_at_k():
     assert recall_at_k(["A", "B"], ["B", "C", "A"], k=2) == 0.5
     assert recall_at_k(["A", "B"], [], k=5) == 0.0

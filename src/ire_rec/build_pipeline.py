@@ -29,6 +29,16 @@ MIND_OUTPUT_FILES = [
     "embeddings/entity_mean_ids.parquet",
 ]
 
+# Files the EB-NeRD embedding stage promises to produce; the up-to-date check
+# requires every one of them (the Q3 loader needs both the .npy matrices and
+# the matching *_ids.parquet row-order files).
+EMBEDDING_OUTPUT_FILES = [
+    "embeddings/word2vec.npy",
+    "embeddings/word2vec_ids.parquet",
+    "embeddings/bert.npy",
+    "embeddings/bert_ids.parquet",
+]
+
 # Top-level config sections that materially affect the generated feature store.
 # Changing any of these invalidates the pipeline cache.
 CONFIG_SIGNATURE_SECTIONS = ("downloads", "dataset_defaults", "temporal_split", "history")
@@ -39,11 +49,13 @@ def _config_signature(cfg: dict) -> str:
 
     Only behavior-affecting sections are included (download URLs, dataset
     defaults/archives, temporal split parameters, history size).  Retrieval
-    config is excluded because it does not change the feature store.  The hash
-    is deterministic and independent of dict insertion order.
+    config is excluded because it does not change the feature store.  The
+    pipeline ``VERSION`` is folded in, so bumping it (a parser/schema
+    implementation change) invalidates every stage's cache.  The hash is
+    deterministic and independent of dict insertion order.
     """
     relevant = {k: cfg.get(k, {}) for k in CONFIG_SIGNATURE_SECTIONS}
-    blob = json.dumps(relevant, sort_keys=True, default=str)
+    blob = json.dumps({"version": VERSION, "config": relevant}, sort_keys=True, default=str)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -60,7 +72,7 @@ def _up_to_date(
         return False
     if prev.get("fingerprints") != fingerprints:
         return False
-    if manifest.get("config_hash") != _config_signature(cfg):
+    if prev.get("config_hash") != _config_signature(cfg):
         return False
     if files is None:
         files = [t + ".parquet" for t in ("articles", "impressions", "history")]
@@ -68,10 +80,32 @@ def _up_to_date(
     return all((base / f).exists() for f in files)
 
 
-def _write_manifest(manifest_path: Path, manifest: dict, cfg: dict) -> None:
-    """Persist the manifest, recording the config that produced the outputs."""
-    manifest["config_hash"] = _config_signature(cfg)
+def _write_manifest(manifest_path: Path, manifest: dict, cfg: dict, key: str) -> None:
+    """Persist the manifest, recording the config that produced one stage.
+
+    The config hash is stored on the stage entry itself (``manifest[key]``),
+    not globally, so a partial rebuild of one dataset never refreshes the cache
+    status of other stages that were built under an older config.
+    """
+    manifest[key]["config_hash"] = _config_signature(cfg)
     dataio.write_manifest(manifest_path, manifest)
+
+
+def _require_mind_entity_vectors(emb_parts: list[dict], archives: list[str]) -> None:
+    """Fail clearly if no MIND archive provides Wikidata entity vectors.
+
+    The Q3 entity_mean article embeddings are built from these vectors; without
+    them there is nothing to pool and the store would be incomplete.  A hard
+    error with an actionable message is preferable to a confusing downstream
+    shape error, and we must never fabricate embeddings.
+    """
+    if not emb_parts:
+        raise RuntimeError(
+            "MIND entity embeddings unavailable: entity_embedding.vec was not "
+            f"found in any MIND archive ({', '.join(archives)}). The entity_mean "
+            "article embeddings that Q3 depends on cannot be built. Provide the "
+            "entity vector file (or an archive that includes it)."
+        )
 
 
 def build_mind(cfg: dict, force: bool, redownload: bool) -> dict:
@@ -112,6 +146,8 @@ def build_mind(cfg: dict, force: bool, redownload: bool) -> dict:
                 "entity_embedding.vec missing in %s (entity vectors skipped for this archive)",
                 arch,
             )
+
+    _require_mind_entity_vectors(emb_parts, archives)
 
     articles = pl.concat(news_parts).unique(subset=dataio.ARTICLE_ID, keep="first")
     impressions = pl.concat(beh_parts)
@@ -293,7 +329,7 @@ def main() -> None:
         ):
             log.info("building MIND")
             manifest["MIND"] = build_mind(cfg, args.rebuild, args.redownload)
-            _write_manifest(manifest_path, manifest, cfg)
+            _write_manifest(manifest_path, manifest, cfg, "MIND")
         else:
             log.info("MIND up to date (use --rebuild to force)")
 
@@ -301,20 +337,25 @@ def main() -> None:
     if wants_ebnerd and not args.skip_embeddings:
         key = EMBEDDINGS_KEY
         build_emb = build_all or (wanted and "EB-NeRD-embeddings" in wanted)
-        if build_emb or any(
+        emb_base = config.processed_dir(cfg) / "EB-NeRD"
+        emb_up_to_date = _up_to_date(
+            cfg,
+            manifest,
+            key,
+            _emb_fp(cfg),
+            files=EMBEDDING_OUTPUT_FILES,
+            base_dir=emb_base,
+        )
+        # Rebuild embeddings when requested, when this stage's own outputs are
+        # stale/missing (e.g. a deleted .npy/_ids.parquet), or when any bundle
+        # needs rebuilding and the embedding stage may therefore be incomplete.
+        if build_emb or not emb_up_to_date or any(
             not _up_to_date(cfg, manifest, b, _ebnerd_fp(cfg, b)) for b in ("demo", "small")
         ):
-            if args.rebuild or not _up_to_date(
-                cfg,
-                manifest,
-                key,
-                _emb_fp(cfg),
-                files=["embeddings/word2vec.npy", "embeddings/bert.npy"],
-                base_dir=config.processed_dir(cfg) / "EB-NeRD",
-            ):
+            if args.rebuild or not emb_up_to_date:
                 log.info("building EB-NeRD article embeddings")
                 manifest[key] = build_ebnerd_embeddings(cfg, args.rebuild, args.redownload)
-                _write_manifest(manifest_path, manifest, cfg)
+                _write_manifest(manifest_path, manifest, cfg, key)
 
     for bundle in ("demo", "small"):
         key = f"EB-NeRD-{bundle}"
@@ -322,13 +363,13 @@ def main() -> None:
             if args.rebuild or not _up_to_date(cfg, manifest, key, _ebnerd_fp(cfg, bundle)):
                 log.info("building %s", key)
                 manifest[key] = build_ebnerd_bundle(cfg, bundle, args.rebuild, args.redownload)
-                _write_manifest(manifest_path, manifest, cfg)
+                _write_manifest(manifest_path, manifest, cfg, key)
             else:
                 log.info("%s up to date (use --rebuild to force)", key)
 
-    # Persist without re-stamping config_hash: the hash is only updated when a
-    # dataset is actually rebuilt (see _write_manifest), so a config change for
-    # datasets outside this run's --datasets scope stays stale and triggers a
+    # Persist without re-stamping any config hash: hashes are only updated when
+    # a stage is actually rebuilt (see _write_manifest), so a config change for
+    # stages outside this run's --datasets scope stays stale and triggers a
     # rebuild on the next full run.
     dataio.write_manifest(manifest_path, manifest)
     log.info("all done in %.1fs", time.time() - started)

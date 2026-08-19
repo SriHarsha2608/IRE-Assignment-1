@@ -357,8 +357,7 @@ def test_up_to_date_requires_matching_config_hash(tmp_path):
     fp = {"a.zip": "fp1"}
     manifest = {
         "version": "2",
-        "config_hash": _config_signature(cfg),
-        "MIND": {"fingerprints": fp},
+        "MIND": {"fingerprints": fp, "config_hash": _config_signature(cfg)},
     }
     assert _up_to_date(cfg, manifest, "MIND", fp) is True
     # changing a behavior-affecting config invalidates the cache
@@ -388,8 +387,7 @@ def test_up_to_date_mind_requires_embedding_outputs(tmp_path):
     fp = {"a.zip": "fp1"}
     manifest = {
         "version": "2",
-        "config_hash": _config_signature(cfg),
-        "MIND": {"fingerprints": fp},
+        "MIND": {"fingerprints": fp, "config_hash": _config_signature(cfg)},
     }
     assert _up_to_date(cfg, manifest, "MIND", fp, files=MIND_OUTPUT_FILES) is True
     # deleting either embedding artifact must make MIND stale
@@ -398,6 +396,36 @@ def test_up_to_date_mind_requires_embedding_outputs(tmp_path):
     (emb / "entity_mean.npy").write_bytes(b"x")
     (emb / "entity_mean_ids.parquet").unlink()
     assert _up_to_date(cfg, manifest, "MIND", fp, files=MIND_OUTPUT_FILES) is False
+
+
+def test_up_to_date_embeddings_requires_ids_parquets(tmp_path):
+    """The EB-NeRD embedding stage needs the *_ids.parquet files too."""
+    from ire_rec.build_pipeline import (
+        EMBEDDING_OUTPUT_FILES,
+        _config_signature,
+        _up_to_date,
+    )
+
+    cfg = _minimal_cfg(tmp_path)
+    base = Path(cfg["paths"]["processed_dir"]) / "EB-NeRD"
+    for f in EMBEDDING_OUTPUT_FILES:
+        (base / f).parent.mkdir(parents=True, exist_ok=True)
+        (base / f).write_bytes(b"x")
+    fp = {"w2v": "fp1", "bert": "fp2"}
+    manifest = {
+        "version": "2",
+        "EB-NeRD-embeddings": {"fingerprints": fp, "config_hash": _config_signature(cfg)},
+    }
+    assert _up_to_date(
+        cfg, manifest, "EB-NeRD-embeddings", fp, files=EMBEDDING_OUTPUT_FILES, base_dir=base
+    ) is True
+    # deleting any single artifact (especially an *_ids.parquet) makes it stale
+    for f in ("embeddings/word2vec_ids.parquet", "embeddings/bert_ids.parquet", "embeddings/word2vec.npy", "embeddings/bert.npy"):
+        (base / f).unlink()
+        assert _up_to_date(
+            cfg, manifest, "EB-NeRD-embeddings", fp, files=EMBEDDING_OUTPUT_FILES, base_dir=base
+        ) is False
+        (base / f).write_bytes(b"x")
 
 
 def test_pipeline_orchestration_config_change_triggers_rebuild(monkeypatch, tmp_path):
@@ -469,10 +497,151 @@ def test_pipeline_orchestration_config_change_triggers_rebuild(monkeypatch, tmp_
     bp.main()
     assert calls["n"] == 2
 
-    # manifest reflects the new config
+    # manifest reflects the new config (per-stage hash, not a global one)
     import json as _json
 
     m = _json.loads(
         (Path(cfg["paths"]["processed_dir"]) / "manifest.json").read_text()
     )
-    assert m["config_hash"] == bp._config_signature(cfg)
+    assert m["MIND"]["config_hash"] == bp._config_signature(cfg)
+    assert "config_hash" not in m  # no global hash remains
+
+
+def test_pipeline_per_stage_config_hash_invalidation(monkeypatch, tmp_path):
+    """A partial rebuild must not refresh other stages' cache status.
+
+    build all under config A -> change config -> rebuild only MIND -> EB-NeRD
+    stages must STILL be stale -> rebuild EB-NeRD -> they become current.
+    """
+    import sys
+
+    import numpy as np
+
+    import ire_rec.build_pipeline as bp
+
+    cfg = _minimal_cfg(tmp_path)
+    proc = bp.config.processed_dir(cfg)
+
+    def _write_bundle_files(dset_dir: Path):
+        dset_dir.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"article_id": ["E1"], "title": ["t"], "abstract": ["a"]}).write_parquet(
+            dset_dir / "articles.parquet"
+        )
+        pl.DataFrame(
+            {
+                "impression_id": ["I1"],
+                "user_id": ["U1"],
+                "impression_time": [dt.datetime(2023, 1, 1)],
+                "split": ["val"],
+                "history": [[]],
+                "inview": [["E1"]],
+                "labels": [[1]],
+            }
+        ).write_parquet(dset_dir / "impressions.parquet")
+        pl.DataFrame({"article_id": ["E1"]}).write_parquet(dset_dir / "history.parquet")
+
+    def fake_build_mind(cfg_, force, redownload):
+        dset = proc / "MIND"
+        emb = dset / "embeddings"
+        emb.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame({"article_id": ["N1"], "title": ["t"], "abstract": ["a"]}).write_parquet(
+            dset / "articles.parquet"
+        )
+        pl.DataFrame(
+            {
+                "impression_id": ["I1"],
+                "user_id": ["U1"],
+                "impression_time": [dt.datetime(2023, 1, 1)],
+                "split": ["val"],
+                "history": [[]],
+                "inview": [["N1"]],
+                "labels": [[1]],
+            }
+        ).write_parquet(dset / "impressions.parquet")
+        pl.DataFrame({"article_id": ["N1"]}).write_parquet(dset / "history.parquet")
+        np.save(emb / "entity_mean.npy", np.zeros((1, 3), dtype=np.float32))
+        pl.DataFrame({"article_id": ["N1"]}).write_parquet(emb / "entity_mean_ids.parquet")
+        return {"fingerprints": {}, "articles": 1, "impressions": 1, "splits": {}, "embeddings": {}}
+
+    def fake_build_ebnerd_bundle(cfg_, bundle, force, redownload):
+        _write_bundle_files(proc / f"EB-NeRD-{bundle}")
+        return {"fingerprints": {}, "articles": 1, "impressions": 1, "history_rows": 1, "splits": {}}
+
+    def fake_build_ebnerd_embeddings(cfg_, force, redownload):
+        emb = proc / "EB-NeRD" / "embeddings"
+        emb.mkdir(parents=True, exist_ok=True)
+        for name in ("word2vec", "bert"):
+            np.save(emb / f"{name}.npy", np.zeros((1, 3), dtype=np.float32))
+            pl.DataFrame({"article_id": ["E1"]}).write_parquet(emb / f"{name}_ids.parquet")
+        return {"fingerprints": {}, "artifacts": {}}
+
+    calls = {"mind": 0, "demo": 0, "small": 0, "emb": 0}
+
+    def _count(name, fn):
+        def wrapper(*a, **k):
+            calls[name] += 1
+            return fn(*a, **k)
+
+        return wrapper
+
+    monkeypatch.setattr(bp.config, "load_config", lambda: cfg)
+    monkeypatch.setattr(bp, "build_mind", _count("mind", fake_build_mind))
+    monkeypatch.setattr(
+        bp,
+        "build_ebnerd_bundle",
+        lambda *a, **k: _count("demo", fake_build_ebnerd_bundle)(*a, **k)
+        if a[1] == "demo"
+        else _count("small", fake_build_ebnerd_bundle)(*a, **k),
+    )
+    monkeypatch.setattr(bp, "build_ebnerd_embeddings", _count("emb", fake_build_ebnerd_embeddings))
+
+    import json as _json
+
+    def _manifest():
+        return _json.loads((proc / "manifest.json").read_text())
+
+    # 1) build all under config A
+    monkeypatch.setattr(sys, "argv", ["ire_rec.build_pipeline", "--datasets", "all"])
+    bp.main()
+    assert calls == {"mind": 1, "demo": 1, "small": 1, "emb": 1}
+    sig_a = bp._config_signature(cfg)
+    m = _manifest()
+    assert m["MIND"]["config_hash"] == sig_a
+    assert m["EB-NeRD-demo"]["config_hash"] == sig_a
+    assert m["EB-NeRD-small"]["config_hash"] == sig_a
+    assert m["EB-NeRD-embeddings"]["config_hash"] == sig_a
+
+    # 2) unchanged config -> nothing rebuilds
+    bp.main()
+    assert calls == {"mind": 1, "demo": 1, "small": 1, "emb": 1}
+
+    # 3) config B: rebuild ONLY MIND
+    cfg["temporal_split"]["val_days"] = 5
+    sig_b = bp._config_signature(cfg)
+    monkeypatch.setattr(sys, "argv", ["ire_rec.build_pipeline", "--datasets", "MIND"])
+    bp.main()
+    assert calls["mind"] == 2
+    assert calls["demo"] == 1 and calls["small"] == 1 and calls["emb"] == 1
+    m = _manifest()
+    assert m["MIND"]["config_hash"] == sig_b  # MIND refreshed
+    # EB-NeRD stages were built under config A -> must STILL be stale
+    assert m["EB-NeRD-demo"]["config_hash"] == sig_a
+    assert m["EB-NeRD-small"]["config_hash"] == sig_a
+    assert m["EB-NeRD-embeddings"]["config_hash"] == sig_a
+    assert bp._up_to_date(cfg, m, "EB-NeRD-demo", {}) is False
+
+    # 4) rebuild EB-NeRD stages under config B -> they become current
+    monkeypatch.setattr(
+        sys, "argv", ["ire_rec.build_pipeline", "--datasets", "EB-NeRD-demo,EB-NeRD-small"]
+    )
+    bp.main()
+    assert calls["demo"] == 2 and calls["small"] == 2 and calls["emb"] == 2
+    m = _manifest()
+    for key in ("EB-NeRD-demo", "EB-NeRD-small", "EB-NeRD-embeddings"):
+        assert m[key]["config_hash"] == sig_b
+    assert bp._up_to_date(cfg, m, "EB-NeRD-demo", {}) is True
+
+    # 5) full run now does nothing (all stages current under config B)
+    monkeypatch.setattr(sys, "argv", ["ire_rec.build_pipeline", "--datasets", "all"])
+    bp.main()
+    assert calls == {"mind": 2, "demo": 2, "small": 2, "emb": 2}

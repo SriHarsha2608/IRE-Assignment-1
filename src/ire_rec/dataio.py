@@ -20,6 +20,7 @@ N_INVIEWS = "n_inviews"
 N_CLICKS = "n_clicks"
 
 IMPRESSION_ID = "impression_id"
+IMPRESSION_ROW_ID = "impression_row_id"
 USER_ID = "user_id"
 IMPRESSION_TIME = "impression_time"
 HISTORY = "history"

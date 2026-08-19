@@ -59,7 +59,7 @@ python -m ire_rec.build_pipeline --rebuild --skip-embeddings   # rebuild without
 |---|------|----------|
 | Q1 | Reproducible data pipeline | `make data` -> `src/ire_rec/build_pipeline.py`, `datasets/`, `split.py`, `dataio.py` |
 | Q2 | BM25 lexical retrieval | `src/ire_rec/retrieval/bm25.py` |
-| Q3 | Embedding/semantic retrieval | `src/ire_rec/retrieval/semantic.py`, `run_semantic.py` (`make semantic` → `retrieval/semantic/<emb>/` candidates + recall/comparison; fair BM25-vs-semantic recall on the embedding-covered GT population with coverage reported). MIND embeddings are mean-pooled Wikidata entity vectors (`entity_mean`, 100-d, ~87% coverage), **not** BERT/XLM-R. |
+| Q3 | Embedding/semantic retrieval | `src/ire_rec/retrieval/semantic.py`, `run_semantic.py` (`make semantic` → `retrieval/semantic/<emb>/` candidates + recall/comparison; fair row-level BM25-vs-semantic recall on the embedding-covered GT population with coverage reported). MIND embeddings are mean-pooled Wikidata entity vectors (`entity_mean`, 100-d, ~87% coverage), **not** BERT/XLM-R. |
 | Q4 | Evaluation harness | `src/ire_rec/evaluation/` |
 | Q5 | Codabench submissions | `predictions/` |
 | Q6 | Design note (<=4 pages) | `report/design_note.pdf` |
