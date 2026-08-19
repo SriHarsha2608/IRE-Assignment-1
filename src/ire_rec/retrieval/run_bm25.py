@@ -78,7 +78,7 @@ def run_bm25(
     impressions = read_df(dset_dir / "impressions.parquet")
 
     sel_impr = impressions.filter(pl.col(SPLIT).is_in(splits))
-    if limit:
+    if limit is not None:
         sel_impr = sel_impr.head(limit)
     if sel_impr.height == 0:
         log.warning("%s: no impressions for splits %s", dataset, splits)

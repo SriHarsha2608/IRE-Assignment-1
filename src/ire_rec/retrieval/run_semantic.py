@@ -32,10 +32,6 @@ def _embedding_dir(cfg: dict, dataset: str, embedding: str | None) -> tuple[Path
     return processed_dir(cfg) / "EB-NeRD" / "embeddings", name
 
 
-def _candidates_dir(cfg: dict, dataset: str, embedding: str) -> Path:
-    return processed_dir(cfg) / dataset / "retrieval" / "semantic" / embedding
-
-
 def _gt_clicked(labels, inview):
     """Ground-truth clicked articles for an impression's inview list."""
     if len(labels) != len(inview):
@@ -132,16 +128,93 @@ def _bm25_cold_warm(bm25_dir: Path, impressions: pl.DataFrame, k: int) -> dict[s
     return out
 
 
+def _gt_all_covered(covered: set[str]) -> pl.Expr:
+    """Row filter: impression's ground-truth clicks are all embedding-covered."""
+    return pl.struct(["gt_clicked"]).map_elements(
+        lambda r: all(a in covered for a in r["gt_clicked"]),
+        return_dtype=pl.Boolean,
+    )
+
+
+def _fair_compare(
+    bm25_dir: Path,
+    sem_dir: Path,
+    covered: set[str],
+    catalog_n: int,
+    top_k: list[int],
+) -> dict:
+    """Fair BM25-vs-semantic recall on the embedding-covered GT population.
+
+    Direct recall@K is unfair when the two methods search different candidate
+    universes: semantic retrieval can only ever retrieve articles that have an
+    embedding, so ground-truth clicks on unembedded articles are unreachable
+    for it.  To make the ceiling equal for both methods, recall is reported on
+    impressions whose ground-truth clicked articles are ALL embedding-covered
+    (``gt_clicked subseteq covered``).  Candidate universes still differ (BM25
+    searches the full catalog, semantic searches the covered subset) and that
+    difference is reported explicitly via ``coverage``.
+    """
+    out: dict = {
+        "coverage": round(len(covered) / catalog_n, 4) if catalog_n else 0.0,
+        "n_covered_articles": len(covered),
+        "n_catalog_articles": catalog_n,
+        "population": (
+            "impressions with >=1 click whose gt_clicked are all "
+            "embedding-covered (equal recall ceiling for both methods)"
+        ),
+        "note": (
+            "BM25 searched the full article catalog; semantic searched only "
+            "embedding-covered articles. Coverage is reported above so the "
+            "smaller semantic candidate universe is not hidden."
+        ),
+        "splits": {},
+    }
+    bm25_files = {
+        f.stem.split("_", 1)[1]: f for f in bm25_dir.glob("candidates_*.parquet")
+    } if bm25_dir.exists() else {}
+    sem_files = {
+        f.stem.split("_", 1)[1]: f for f in sem_dir.glob("candidates_*.parquet")
+    } if sem_dir.exists() else {}
+    for sn in sorted(set(bm25_files) | set(sem_files)):
+        if sn not in ("val", "test"):
+            continue
+        if sn not in sem_files:
+            continue
+        raw = pl.read_parquet(sem_files[sn]).filter(
+            pl.col("gt_clicked").list.len() > 0
+        )
+        fair = raw.filter(_gt_all_covered(covered))
+        entry: dict = {
+            "n_gt_nonempty": int(raw.height),
+            "n_fair": int(fair.height),
+            "semantic": {f"recall@{k}": _mean_recall(fair, k) for k in sorted(top_k)},
+        }
+        if sn in bm25_files:
+            fair_bm = pl.read_parquet(bm25_files[sn]).filter(
+                pl.col("gt_clicked").list.len() > 0
+            ).filter(_gt_all_covered(covered))
+            entry["bm25"] = {
+                f"recall@{k}": _mean_recall(fair_bm, k) for k in sorted(top_k)
+            }
+        out["splits"][sn] = entry
+    return out
+
+
 def _compare_bm25(
-    cfg: dict,
-    dataset: str,
+    dset_dir: Path,
     sem_dir: Path,
     impressions: pl.DataFrame,
+    covered: set[str],
+    catalog_n: int,
     top_k: list[int],
     slice_k: int,
 ) -> dict:
-    bm25_dir = processed_dir(cfg) / dataset / "retrieval" / "bm25"
-    result: dict = {"top_k": top_k, "slice_k": slice_k}
+    bm25_dir = dset_dir / "retrieval" / "bm25"
+    result: dict = {
+        "top_k": top_k,
+        "slice_k": slice_k,
+        "fair": _fair_compare(bm25_dir, sem_dir, covered, catalog_n, top_k),
+    }
     if not bm25_dir.exists():
         result["bm25"] = None
         return result
@@ -171,18 +244,21 @@ def run_semantic(
     splits: tuple[str, ...],
     limit: int | None = None,
     embedding: str | None = None,
+    dset_dir: Path | None = None,
+    emb_dir: Path | None = None,
 ) -> dict:
     t0 = time.time()
-    dset_dir = processed_dir(cfg) / dataset
+    dset_dir = Path(dset_dir) if dset_dir else processed_dir(cfg) / dataset
     articles = read_df(dset_dir / "articles.parquet")
     impressions = read_df(dset_dir / "impressions.parquet")
 
-    emb_dir, emb_name = _embedding_dir(cfg, dataset, embedding)
+    default_emb_dir, default_name = _embedding_dir(cfg, dataset, embedding)
+    emb_dir = Path(emb_dir) if emb_dir else default_emb_dir
+    emb_name = embedding or default_name
     normalize = cfg["retrieval"]["semantic"].get("normalize", True)
-    ann = cfg["retrieval"]["semantic"].get("ann", "faiss")
 
     sel_impr = impressions.filter(pl.col(SPLIT).is_in(splits))
-    if limit:
+    if limit is not None:
         sel_impr = sel_impr.head(limit)
     if sel_impr.height == 0:
         log.warning("%s: no impressions for splits %s", dataset, splits)
@@ -209,7 +285,9 @@ def run_semantic(
     user_rows = []
     for row in sel_impr.iter_rows(named=True):
         history = row[HISTORY] or []
-        user_vec, n_used = mean_pool_user_vector(history, id_to_row, mat)
+        user_vec, n_used = mean_pool_user_vector(
+            history, id_to_row, mat, normalize=normalize
+        )
         if user_vec is None:
             candidates: list[str] = []
             scores: list[float] = []
@@ -242,7 +320,7 @@ def run_semantic(
         },
     )
 
-    out_dir = _candidates_dir(cfg, dataset, emb_name)
+    out_dir = dset_dir / "retrieval" / "semantic" / emb_name
     out_dir.mkdir(parents=True, exist_ok=True)
     for split_name in splits:
         sub = out.filter(pl.col(SPLIT) == split_name)
@@ -257,7 +335,7 @@ def run_semantic(
         "article_catalog": int(articles.height),
         "embedding_coverage": coverage,
         "impressions": int(out.height),
-        "ann": ann,
+        "ann": "IndexFlatIP",
         "user_repr": "mean_pool",
         "normalize": normalize,
         "elastic_seconds": round(time.time() - t0, 1),
@@ -267,7 +345,9 @@ def run_semantic(
     with open(out_dir / "recall.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)
 
-    comparison = _compare_bm25(cfg, dataset, out_dir, impressions, top_k, slice_k)
+    comparison = _compare_bm25(
+        dset_dir, out_dir, impressions, set(ids), articles.height, top_k, slice_k
+    )
     with open(out_dir / "comparison.json", "w") as f:
         json.dump(comparison, f, indent=2, default=str)
     return summary
