@@ -43,14 +43,19 @@ def _gt_clicked(labels, inview):
     return [aid for aid, lab in zip(inview, labels) if lab == 1]
 
 
-def _read_metrics(out_dir: Path, top_k: list[int]) -> dict[str, dict[str, float]]:
-    """Aggregate recall@K per split from on-disk candidate parquets."""
+def _read_metrics(out_dir: Path, top_k: list[int], splits: tuple[str, ...]) -> dict[str, dict[str, float]]:
+    """Aggregate recall@K per split from on-disk candidate parquets.
+
+    Only the splits produced by the current invocation are aggregated, so a
+    stale ``candidates_*.parquet`` from an earlier (e.g. ``--limit``) run is
+    never silently mixed into the metrics.
+    """
     metrics: dict[str, dict[str, float]] = {}
-    for split_name in sorted(out_dir.glob("candidates_*.parquet")):
-        sn = split_name.stem.split("_", 1)[1]
-        if sn not in ("val", "test"):
+    for sn in splits:
+        split_file = out_dir / f"candidates_{sn}.parquet"
+        if not split_file.exists():
             continue
-        sub = pl.read_parquet(split_name).filter(pl.col("gt_clicked").list.len() > 0)
+        sub = pl.read_parquet(split_file).filter(pl.col("gt_clicked").list.len() > 0)
         if sub.height == 0:
             continue
         metrics[sn] = {}
@@ -132,10 +137,12 @@ def run_bm25(
 
     out_dir = _candidates_dir(cfg, dataset)
     out_dir.mkdir(parents=True, exist_ok=True)
-    for (old,) in [("candidates.parquet",)]:
-        p = out_dir / old
-        if p.exists():
-            p.unlink()
+    # Clear candidate files first so a stale candidates_*.parquet from an
+    # earlier run (e.g. a --limit debug run) can never be mixed with the
+    # current invocation's results: recall.json always corresponds to exactly
+    # one coherent run.  Run --splits val,test together to get both splits.
+    for old in out_dir.glob("candidates*.parquet"):
+        old.unlink()
     for split_name in splits:
         sub = out.filter(pl.col(SPLIT) == split_name)
         if sub.height:
@@ -151,7 +158,7 @@ def run_bm25(
         "query_field": query_field,
         "history_query_cap": cap,
         "elastic_seconds": round(time.time() - t0, 1),
-        "splits": _read_metrics(out_dir, top_k),
+        "splits": _read_metrics(out_dir, top_k, splits),
     }
     with open(out_dir / "recall.json", "w") as f:
         json.dump(summary, f, indent=2, default=str)

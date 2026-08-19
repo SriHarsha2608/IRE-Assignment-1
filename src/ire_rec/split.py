@@ -42,13 +42,25 @@ def add_temporal_split(
             counts["val"],
             counts["test"],
         )
-        out = df.with_row_index("_i").with_columns(
-            pl.when(pl.col("_i") / pl.len() < fallback_ratios[0]).then(pl.lit("train"))
-            .when(pl.col("_i") / pl.len() < fallback_ratios[0] + fallback_ratios[1])
-            .then(pl.lit("val"))
-            .otherwise(pl.lit("test"))
-            .alias(SPLIT)
-        ).drop("_i")
+        # Proportional fallback: rows are sorted by time and split by row
+        # fraction, but identical timestamps must NOT be divided between
+        # splits (same-time impressions belong to the same split).  Each
+        # timestamp group is assigned to a split by the position of its LAST
+        # row, so a group never straddles a boundary.  Deterministic.
+        sorted_df = df.sort(time_col)
+        n = sorted_df.height
+        out = (
+            sorted_df.with_row_index("_i")
+            .with_columns(pl.col("_i").max().over(time_col).alias("_g"))
+            .with_columns(
+                pl.when(pl.col("_g") / n < fallback_ratios[0]).then(pl.lit("train"))
+                .when(pl.col("_g") / n < fallback_ratios[0] + fallback_ratios[1])
+                .then(pl.lit("val"))
+                .otherwise(pl.lit("test"))
+                .alias(SPLIT)
+            )
+            .drop("_i", "_g")
+        )
         counts = {s: out.filter(pl.col(SPLIT) == s).height for s in ("train", "val", "test")}
         method = "fallback_proportional"
     else:

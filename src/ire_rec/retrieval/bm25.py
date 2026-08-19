@@ -111,7 +111,14 @@ class Bm25Index:
         """Return (scores, doc_indices) for the top-``top_k`` documents.
 
         Scores are BM25 similarity to ``query``; only documents sharing at
-        least one term with the query are scored.
+        least one term with the query are scored via the inverted index.  The
+        result is the genuine top-K over the FULL corpus: when fewer than
+        ``top_k`` documents have a positive score, the remaining slots are
+        filled with zero-score documents in deterministic (ascending doc-index)
+        order.  This keeps zero-overlap documents eligible for retrieval (a
+        ground-truth article with no lexical overlap can still fall within the
+        requested K) and never returns fewer than ``min(top_k, corpus_size)``
+        candidates or duplicate indices.
         """
         tokens = query if isinstance(query, list) else tokenize(query)
         scores = np.zeros(self.corpus_size, dtype=np.float64)
@@ -125,12 +132,29 @@ class Bm25Index:
             denom = tf + self.k1 * (1 - b + b * doc_len[di] / self.avgdl)
             term_score = self.idf[term] * (tf * (self.k1 + 1)) / denom
             np.add.at(scores, di, term_score)
+        n_take = min(top_k, self.corpus_size)
         nz = np.flatnonzero(scores)
+        if nz.size >= n_take:
+            # common case: enough overlapping documents; rank them by score
+            sc = scores[nz]
+            order = np.argsort(-sc, kind="stable")[:n_take]
+            return sc[order], nz[order]
+        # scarce overlap: take all positive-scoring docs (score-sorted) and fill
+        # the rest with zero-score docs in ascending doc-index order (ties at 0
+        # are broken deterministically, so the result is the true top-K).
         if nz.size == 0:
-            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.int64)
+            return (
+                np.zeros(n_take, dtype=np.float64),
+                np.arange(n_take, dtype=np.int64),
+            )
         sc = scores[nz]
-        order = np.argsort(-sc, kind="stable")[:top_k]
-        return sc[order], nz[order]
+        order = np.argsort(-sc, kind="stable")
+        picked = nz[order]
+        fill = np.flatnonzero(scores == 0.0)[: n_take - picked.size]
+        return (
+            np.concatenate([sc[order], np.zeros(fill.size, dtype=np.float64)]),
+            np.concatenate([picked, fill]),
+        )
 
 
 def build_corpus(

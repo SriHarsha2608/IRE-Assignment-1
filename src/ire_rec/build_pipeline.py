@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import time
 from pathlib import Path
@@ -17,6 +19,33 @@ VERSION = "2"
 
 EMBEDDINGS_KEY = "EB-NeRD-embeddings"
 
+# Files the MIND pipeline promises to produce; the up-to-date check requires
+# every one of them (Q3 depends on the entity_mean embedding outputs).
+MIND_OUTPUT_FILES = [
+    "articles.parquet",
+    "impressions.parquet",
+    "history.parquet",
+    "embeddings/entity_mean.npy",
+    "embeddings/entity_mean_ids.parquet",
+]
+
+# Top-level config sections that materially affect the generated feature store.
+# Changing any of these invalidates the pipeline cache.
+CONFIG_SIGNATURE_SECTIONS = ("downloads", "dataset_defaults", "temporal_split", "history")
+
+
+def _config_signature(cfg: dict) -> str:
+    """Stable hash of the config values that affect pipeline outputs.
+
+    Only behavior-affecting sections are included (download URLs, dataset
+    defaults/archives, temporal split parameters, history size).  Retrieval
+    config is excluded because it does not change the feature store.  The hash
+    is deterministic and independent of dict insertion order.
+    """
+    relevant = {k: cfg.get(k, {}) for k in CONFIG_SIGNATURE_SECTIONS}
+    blob = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
 
 def _up_to_date(
     cfg: dict,
@@ -31,10 +60,18 @@ def _up_to_date(
         return False
     if prev.get("fingerprints") != fingerprints:
         return False
+    if manifest.get("config_hash") != _config_signature(cfg):
+        return False
     if files is None:
         files = [t + ".parquet" for t in ("articles", "impressions", "history")]
     base = base_dir or (config.processed_dir(cfg) / key)
     return all((base / f).exists() for f in files)
+
+
+def _write_manifest(manifest_path: Path, manifest: dict, cfg: dict) -> None:
+    """Persist the manifest, recording the config that produced the outputs."""
+    manifest["config_hash"] = _config_signature(cfg)
+    dataio.write_manifest(manifest_path, manifest)
 
 
 def build_mind(cfg: dict, force: bool, redownload: bool) -> dict:
@@ -251,10 +288,12 @@ def main() -> None:
     started = time.time()
 
     if build_all or "MIND" in wanted:
-        if args.rebuild or not _up_to_date(cfg, manifest, "MIND", _mind_fp(cfg)):
+        if args.rebuild or not _up_to_date(
+            cfg, manifest, "MIND", _mind_fp(cfg), files=MIND_OUTPUT_FILES
+        ):
             log.info("building MIND")
             manifest["MIND"] = build_mind(cfg, args.rebuild, args.redownload)
-            dataio.write_manifest(manifest_path, manifest)
+            _write_manifest(manifest_path, manifest, cfg)
         else:
             log.info("MIND up to date (use --rebuild to force)")
 
@@ -275,7 +314,7 @@ def main() -> None:
             ):
                 log.info("building EB-NeRD article embeddings")
                 manifest[key] = build_ebnerd_embeddings(cfg, args.rebuild, args.redownload)
-                dataio.write_manifest(manifest_path, manifest)
+                _write_manifest(manifest_path, manifest, cfg)
 
     for bundle in ("demo", "small"):
         key = f"EB-NeRD-{bundle}"
@@ -283,10 +322,14 @@ def main() -> None:
             if args.rebuild or not _up_to_date(cfg, manifest, key, _ebnerd_fp(cfg, bundle)):
                 log.info("building %s", key)
                 manifest[key] = build_ebnerd_bundle(cfg, bundle, args.rebuild, args.redownload)
-                dataio.write_manifest(manifest_path, manifest)
+                _write_manifest(manifest_path, manifest, cfg)
             else:
                 log.info("%s up to date (use --rebuild to force)", key)
 
+    # Persist without re-stamping config_hash: the hash is only updated when a
+    # dataset is actually rebuilt (see _write_manifest), so a config change for
+    # datasets outside this run's --datasets scope stays stale and triggers a
+    # rebuild on the next full run.
     dataio.write_manifest(manifest_path, manifest)
     log.info("all done in %.1fs", time.time() - started)
 
