@@ -138,9 +138,13 @@ def test_run_semantic_end_to_end(tmp_path):
     store.mkdir()
 
     n = 8
-    mat = np.eye(n, dtype=np.float32)
-    mat[2, 0] = 1.0  # a2 = a0 + a1 -> mean(a0, a1) normalizes to a2's direction
-    mat[2, 1] = 1.0
+    mat = np.zeros((n, n), dtype=np.float32)
+    mat[0, 0] = 1.0                      # a0 = e0
+    mat[1, 1] = 2.0                      # a1 = 2*e1 (magnitude differs from a0)
+    mat[2, 0], mat[2, 1] = 1.0, 2.0      # a2 = e0+2*e1 = raw mean(a0,a1) direction
+    mat[3, 0], mat[3, 1] = 1.0, 1.0      # a3 = e0+e1 = normalized-mean direction
+    for i in range(4, n):
+        mat[i, i] = 1.0
     np.save(emb_dir / "w2v.npy", mat)
     pl.DataFrame({"article_id": [f"a{i}" for i in range(n)]}).write_parquet(
         emb_dir / "w2v_ids.parquet"
@@ -192,3 +196,58 @@ def test_run_semantic_end_to_end(tmp_path):
     assert comp["fair"]["coverage"] == 1.0
     assert comp["fair"]["splits"]["val"]["n_fair"] == 2
     assert comp["bm25"] is None  # no bm25 candidates in the synthetic store
+
+
+def test_gt_all_covered_partial_coverage():
+    """Partial embedding coverage: only fully-covered GT impressions pass."""
+    from ire_rec.retrieval.run_semantic import _gt_all_covered
+
+    covered = {"a", "b", "c"}
+    df = pl.DataFrame(
+        {
+            "impression_id": ["I1", "I2", "I3", "I4"],
+            "gt_clicked": [["a"], ["d"], ["a", "d"], ["a", "b"]],
+        }
+    )
+    kept = df.filter(_gt_all_covered(covered))["impression_id"].to_list()
+    assert kept == ["I1", "I4"]  # GT=[a] in, GT=[d] out, GT=[a,d] out, GT=[a,b] in
+
+
+def test_fair_compare_intersects_on_common_impressions(tmp_path):
+    """Fair comparison must evaluate both methods on the SAME impressions.
+
+    Semantic and BM25 candidate files may diverge (e.g. --limit on one side);
+    recall must only be computed on impressions present in both files, not on
+    each file's own population.
+    """
+    from ire_rec.retrieval.run_semantic import _fair_compare
+
+    bm25_dir = tmp_path / "bm25"
+    sem_dir = tmp_path / "sem"
+    bm25_dir.mkdir()
+    sem_dir.mkdir()
+
+    def _write(d: Path, rows):
+        pl.DataFrame(
+            {
+                "impression_id": [r[0] for r in rows],
+                "split": ["val"] * len(rows),
+                "gt_clicked": [r[1] for r in rows],
+                "candidates": [r[2] for r in rows],
+                "scores": [[0.0]] * len(rows),
+            }
+        ).write_parquet(d / "candidates_val.parquet")
+
+    covered = {"a", "b", "c"}
+    # semantic file: I1 (covered GT), I4 (covered GT), I2 (uncovered GT)
+    _write(sem_dir, [("I1", ["a"], ["a"]), ("I4", ["a"], ["a"]), ("I2", ["d"], ["d"])])
+    # bm25 file: I1, I2, and I5 (I4 missing, I5 extra -> only {I1, I2} in common)
+    _write(bm25_dir, [("I1", ["a"], ["a"]), ("I2", ["d"], ["d"]), ("I5", ["a"], ["a"])])
+
+    out = _fair_compare(bm25_dir, sem_dir, covered, catalog_n=4, top_k=[50])
+    entry = out["splits"]["val"]
+    assert entry["n_gt_nonempty"] == 2        # common impressions {I1, I2}
+    assert entry["n_fair"] == 1               # only I1 is gt-covered in common
+    assert entry["n_fair_bm"] == 1
+    assert entry["semantic"]["recall@50"] == 1.0
+    assert entry["bm25"]["recall@50"] == 1.0

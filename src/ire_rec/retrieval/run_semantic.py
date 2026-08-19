@@ -153,6 +153,14 @@ def _fair_compare(
     (``gt_clicked subseteq covered``).  Candidate universes still differ (BM25
     searches the full catalog, semantic searches the covered subset) and that
     difference is reported explicitly via ``coverage``.
+
+    Both methods are evaluated on the SAME impression population: candidate
+    files are intersected on ``impression_id`` before the gt-coverage filter,
+    so a partial/--limit run on one side cannot silently change the other
+    side's recall population.  ``n_gt_nonempty`` is the number of distinct
+    common impressions with >=1 click; ``n_fair``/``n_fair_bm`` are the row
+    counts of the gt-covered subset (equal when the two files carry the same
+    rows for the common impressions).
     """
     out: dict = {
         "coverage": round(len(covered) / catalog_n, 4) if catalog_n else 0.0,
@@ -165,7 +173,10 @@ def _fair_compare(
         "note": (
             "BM25 searched the full article catalog; semantic searched only "
             "embedding-covered articles. Coverage is reported above so the "
-            "smaller semantic candidate universe is not hidden."
+            "smaller semantic candidate universe is not hidden. Recall is "
+            "computed on impressions present in BOTH candidate files "
+            "(intersected on impression_id) whose gt_clicked are all "
+            "embedding-covered."
         ),
         "splits": {},
     }
@@ -180,19 +191,30 @@ def _fair_compare(
             continue
         if sn not in sem_files:
             continue
-        raw = pl.read_parquet(sem_files[sn]).filter(
+        sem_df = pl.read_parquet(sem_files[sn]).filter(
             pl.col("gt_clicked").list.len() > 0
         )
-        fair = raw.filter(_gt_all_covered(covered))
+        common = set(sem_df[IMPRESSION_ID].to_list())
+        bm_df = None
+        if sn in bm25_files:
+            bm_df = pl.read_parquet(bm25_files[sn]).filter(
+                pl.col("gt_clicked").list.len() > 0
+            )
+            common &= set(bm_df[IMPRESSION_ID].to_list())
+        # Both methods must be scored on the same impressions: intersect on
+        # impression_id before filtering on gt coverage.
+        sem_df = sem_df.filter(pl.col(IMPRESSION_ID).is_in(common))
+        fair = sem_df.filter(_gt_all_covered(covered))
         entry: dict = {
-            "n_gt_nonempty": int(raw.height),
+            "n_gt_nonempty": len(common),
             "n_fair": int(fair.height),
             "semantic": {f"recall@{k}": _mean_recall(fair, k) for k in sorted(top_k)},
         }
-        if sn in bm25_files:
-            fair_bm = pl.read_parquet(bm25_files[sn]).filter(
-                pl.col("gt_clicked").list.len() > 0
-            ).filter(_gt_all_covered(covered))
+        if bm_df is not None:
+            fair_bm = bm_df.filter(pl.col(IMPRESSION_ID).is_in(common)).filter(
+                _gt_all_covered(covered)
+            )
+            entry["n_fair_bm"] = int(fair_bm.height)
             entry["bm25"] = {
                 f"recall@{k}": _mean_recall(fair_bm, k) for k in sorted(top_k)
             }
