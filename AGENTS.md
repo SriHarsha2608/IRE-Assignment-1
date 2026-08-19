@@ -1,6 +1,6 @@
 # AGENTS.md
 
-IRE Assignment 1: lexical (BM25) + semantic (embedding/ANN) retrieval pipeline on MIND (English) and EB-NeRD (Danish). Spec: `Assignment1_v1.pdf`. Q1 (data pipeline) and Q2 (BM25) are done; Q3–Q5 are pending.
+IRE Assignment 1: lexical (BM25) + semantic (embedding/ANN) retrieval pipeline on MIND (English) and EB-NeRD (Danish). Spec: `Assignment1_v1.pdf`. Q1 (data pipeline), Q2 (BM25), and Q3 (semantic/embedding) are done; Q4–Q5 are pending.
 
 ## Environment (critical)
 
@@ -48,18 +48,23 @@ make test         # unit tests (synthetic data only, no raw files needed)
 - `pyproject.toml` declares runtime deps (mirrors `requirements.txt`); `make install` is still the canonical bootstrap.
 - **Pipeline version guard**: `build_pipeline.py` has `VERSION` (currently `"2"`). If you change the store schema or output layout, **bump `VERSION`** — otherwise `make pipeline` sees a matching manifest and skips the rebuild.
 
-## Retrieval (Q2 done, Q3 pending)
+## Retrieval (Q2 + Q3 done, Q4 pending)
 
 - `retrieval/bm25.py` implements its **own** inverted-index BM25 (numpy-vectorized postings `np.add.at`); do NOT switch to `rank_bm25.BM25Okapi` (`get_scores` scans the whole 65k-doc corpus per query → ~10 min/run vs ~6 min vectorized). IDF = `ln((N - df + 0.5)/(df + 0.5)) + 1`; negative raw IDF terms are floored to `epsilon * average_idf` (rank-bm25's ATIRE-style floor) so a query term never lowers a score. Real corpora have 0 negative-IDF terms, so the floor never fires in production.
 - `retrieval/run_bm25.py` (make `lexical`): builds index over ALL articles (title_abstract), query = titles of up to `history_query_cap` (default 20) most-recent history clicks, retrieves top-K ∈ {50,100,200}, writes `data/processed/<DS>/retrieval/bm25/candidates_{split}.parquet` (`impression_id, split, gt_clicked, candidates, scores, n_query_terms`) + aggregated `recall.json` per dataset. Default `--splits val`; pass `--splits val,test` for both. Candidates are written per-split and recall.json aggregates over whatever per-split files are on disk, so separate val/test runs merge cleanly — rerunning one split keeps the other's recall entries.
 - **Q2 gold numbers (BM25 title_abstract, mean recall over impressions with ≥1 click)**: MIND val 0.008/0.016/0.028, test 0.007/0.015/0.025; EB-NeRD-demo val 0.008/0.012/0.022, test 0.008/0.018/0.034; EB-NeRD-small val 0.006/0.010/0.017, test 0.006/0.012/0.022 (K=50/100/200). Low-but-topical retrieval is expected for a candidate generator; the query is title-only and the candidate space is the full catalog.
-- Full MIND run ≈ 6 min/split, EB-NeRD-small ≈ 2 min/split. Use `--limit N` for quick smoke tests. Retrieval cost is linear in impressions — running `val,test` in one invocation does not double the work beyond the extra rows.
+- `retrieval/semantic.py` (Q3): loads `{name}.npy` + `{name}_ids.parquet` (`load_embeddings`, restricted to the dataset's article catalog so the candidate space matches BM25), L2-normalizes and builds a FAISS `IndexFlatIP` (exact cosine — fine up to 65k×768; HNSW/IVF are the 10×-scale options), mean-pools the user's history-article embeddings (`mean_pool_user_vector`; empty history → `None` = cold start, no search). `retrieval/run_semantic.py` (make `semantic`) mirrors run_bm25's CLI (`--datasets --splits --top-k --limit --embedding`); outputs go to `retrieval/semantic/<emb>/candidates_{split}.parquet` (`impression_id, split, gt_clicked, candidates, scores, n_history_used, n_history`) + `recall.json` + `comparison.json` (BM25 vs semantic recall table + cold-start/warm slice at recall@maxK).
+- **Q3 gold numbers (semantic, mean recall over impressions with ≥1 click)**: MIND `entity_mean` (100-d, 87% coverage) val 0.002/0.004/0.007, test 0.002/0.003/0.006; EB-NeRD-demo `word2vec` val 0.007/0.013/0.027, test 0.006/0.011/0.019; EB-NeRD-small `word2vec` val 0.005/0.010/0.019, test 0.004/0.007/0.012 (K=50/100/200). Default EB-NeRD embedding is `word2vec` (config `retrieval.semantic.embedding`); pass `--embedding bert` to switch — bert demo val recall@200 0.030 (beats BM25 0.022) but is similar/slightly weaker on small. **Takeaway: BM25 ≫ entity_mean semantic on MIND (entity pooling is a weak signal, 13% of articles are unembeddable); semantic ≈/slightly < BM25 on EB-NeRD (word2vec/bert capture Danish topical similarity well).**
+- Cold-start users (empty history) get an empty query in both BM25 and semantic → empty candidates → 0 recall (MIND val has 1507 cold impressions, EB-NeRD demo/small have none in val/test).
+- **MIND dev quirk**: some `impression_id` values are reused for genuinely distinct impressions (13 921 dup ids, test split only). run_bm25/run_semantic process one row per impression row (recall.json is per-row, matching Q2 gold numbers); the Q3 comparison's cold/warm slice dedupes on `impression_id` (keep-first, per-split) so both methods are sliced on identical populations.
+- Full MIND semantic run ≈ 4.5 min (val+test), EB-NeRD-small word2vec ≈ 7 min, bert ≈ 14 min. Use `--limit N` for quick smoke tests.
 
 ## Tests
 
 - `tests/test_data_pipeline.py`: 11 tests, fully synthetic (no data/ needed), fast. Covers TSV parsing, labels, temporal split (day + fallback), entity pooling, history causality/cap, unified history schema, cold-start `[]`, and train-only popularity.
 - `tests/test_bm25.py`: 7 tests covering the BM25 index, query-from-history capping, recall@K, corpus field variants.
-- `make lexical`/`semantic`/`eval`/`predict` reference modules — lexical now exists and works; `semantic`/`eval`/`predict` (Q3–Q5) still pending; don't run them.
+- `tests/test_semantic.py`: 6 tests covering embedding load + catalog restriction, L2-normalize + FAISS cosine index, mean-pool user vector, cold-start `None`, and result padding.
+- `make lexical` and `make semantic` (Q2/Q3) both work; `eval`/`predict` (Q4/Q5) still pending; don't run them.
 
 ## Git
 
