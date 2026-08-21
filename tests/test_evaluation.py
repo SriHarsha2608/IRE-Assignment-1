@@ -81,6 +81,32 @@ def test_ndcg_no_positive():
     assert M.ndcg_at_k_from_ranked([0, 0, 0], 5) is None
 
 
+# --- IDCG must be capped at min(n_pos, k) (spec 1) ---
+def test_ndcg_idcg_capped_10pos_k5_perfect():
+    # 10 positives, K=5, first 5 are positives -> perfect ranking -> 1.0
+    rl = [1] * 10
+    assert M.ndcg_at_k_from_ranked(rl, 5) == pytest.approx(1.0)
+
+
+def test_ndcg_idcg_capped_10pos_k5_partial():
+    # 10 positives, K=5, only 3 in top-5 -> strictly less than 1
+    rl = [1, 1, 1, 0, 0, 1, 1, 1, 1, 1]
+    val = M.ndcg_at_k_from_ranked(rl, 5)
+    assert 0.0 < val < 1.0
+
+
+def test_ndcg_idcg_pos_less_than_k():
+    # n_pos=2 < K=5 -> two positives on top -> 1.0
+    rl = [1, 1, 0, 0, 0]
+    assert M.ndcg_at_k_from_ranked(rl, 5) == pytest.approx(1.0)
+
+
+def test_ndcg_idcg_fewer_than_k_items():
+    # fewer inview items than K is still correct
+    rl = [1, 1]
+    assert M.ndcg_at_k_from_ranked(rl, 5) == pytest.approx(1.0)
+
+
 # ---------------------------------------------------------------------------
 # diversity
 # ---------------------------------------------------------------------------
@@ -194,6 +220,20 @@ def _cand_df(rows):
             "impression_id": pl.String,
             "split": pl.String,
             "gt_clicked": pl.List(pl.String),
+            "candidates": pl.List(pl.String),
+            "scores": pl.List(pl.Float64),
+            "n_query_terms": pl.Int32,
+        },
+    )
+
+
+def _cand_df_no_gt(rows):
+    return pl.DataFrame(
+        rows,
+        schema={
+            "impression_row_id": pl.UInt32,
+            "impression_id": pl.String,
+            "split": pl.String,
             "candidates": pl.List(pl.String),
             "scores": pl.List(pl.Float64),
             "n_query_terms": pl.Int32,
@@ -334,7 +374,7 @@ def test_evaluate_no_positive_labels():
 # ---------------------------------------------------------------------------
 # extended validation (spec 1 A-E)
 # ---------------------------------------------------------------------------
-def _build_case(impr_data: dict, cand_data: list, arts=None):
+def _build_case(impr_data: dict, cand_data: list, arts=None, with_gt=True):
     if arts is None:
         arts = pl.DataFrame({
             "article_id": ["a", "b", "c", "d", "e"],
@@ -346,7 +386,7 @@ def _build_case(impr_data: dict, cand_data: list, arts=None):
     impr = pl.DataFrame(impr_data).with_columns(
         pl.col("history").cast(pl.List(pl.String))
     )
-    cand = _cand_df(cand_data)
+    cand = _cand_df(cand_data) if with_gt else _cand_df_no_gt(cand_data)
     return cand, impr, p_lookup, id_to_cat, cs, cc
 
 
@@ -403,6 +443,44 @@ def test_validate_nonfinite_score():
     )
     with pytest.raises(ValueError):
         evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+# ---------------------------------------------------------------------------
+# gt_clicked must be REQUIRED (spec 2)
+# ---------------------------------------------------------------------------
+def test_validate_gt_clicked_column_missing():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["a"]],
+         "labels": [[1]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "candidates": ["a"], "scores": [0.5], "n_query_terms": 1}],
+        with_gt=False,
+    )
+    with pytest.raises(ValueError):
+        evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+def test_validate_gt_clicked_null():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["a"]],
+         "labels": [[1]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "gt_clicked": None, "candidates": ["a"], "scores": [0.5], "n_query_terms": 1}],
+    )
+    with pytest.raises(ValueError):
+        evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+def test_validate_gt_clicked_correct_passes():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["a", "b"]],
+         "labels": [[1, 0]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "gt_clicked": ["a"], "candidates": ["a"], "scores": [0.5], "n_query_terms": 1}],
+    )
+    # no ValueError raised
+    res = evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+    assert res["n_impressions"] == 1
 
 
 def test_select_candidate_rows_deterministic_by_row_id():
@@ -505,3 +583,10 @@ def test_discovery_no_candidates_fails(tmp_path):
                        with_sem_entity=False, with_bert=False)
     with pytest.raises(ValueError):
         run_eval(_tmp_cfg(tmp_path), ["D"], ("val",))
+
+
+def test_requested_dataset_missing_fails(tmp_path):
+    # "D" exists but "GHOST" is explicitly requested and missing articles.parquet
+    _write_tmp_dataset(tmp_path, "D")
+    with pytest.raises(ValueError):
+        run_eval(_tmp_cfg(tmp_path), ["D", "GHOST"], ("val",))

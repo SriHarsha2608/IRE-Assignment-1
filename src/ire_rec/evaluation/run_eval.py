@@ -86,6 +86,8 @@ def _validate(cand: pl.DataFrame, split: str) -> None:
         )
     if "candidates" not in cand.columns or "scores" not in cand.columns:
         raise ValueError("candidate file missing 'candidates'/'scores'")
+    if "gt_clicked" not in cand.columns:
+        raise ValueError("candidate file missing required 'gt_clicked' column")
     nc = cand.select(pl.col("candidates").list.len().alias("_nc"))
     ns = cand.select(pl.col("scores").list.len().alias("_ns"))
     if not (nc["_nc"].to_numpy() == ns["_ns"].to_numpy()).all():
@@ -136,15 +138,16 @@ def _validate_joined(joined: pl.DataFrame, catalog_set: set, split: str) -> None
             if s is None or not math.isfinite(s):
                 raise ValueError("candidate scores contain NaN/Inf (must be finite)")
 
-        # B. gt_clicked must equal click-derived ground truth (insertion order,
-        # exactly matching Q2/Q3: [aid for aid, lab in zip(inview, labels) if lab == 1]).
-        if gt is not None:
-            derived = [a for a, l in zip(inv, [int(x) for x in lab]) if l == 1]
-            if derived != gt:
-                raise ValueError(
-                    "candidate gt_clicked does not match click-derived ground truth "
-                    "(inview/labels)"
-                )
+        # B. gt_clicked must be present (non-null) and equal click-derived
+        # ground truth (insertion order, matching Q2/Q3).
+        if gt is None:
+            raise ValueError("candidate gt_clicked is missing or null")
+        derived = [a for a, l in zip(inv, [int(x) for x in lab]) if l == 1]
+        if derived != gt:
+            raise ValueError(
+                "candidate gt_clicked does not match click-derived ground truth "
+                "(inview/labels)"
+            )
 
 
 def _determine_ranking(inview, labels, cand_ids, cand_scores):
@@ -394,8 +397,10 @@ def run_eval(
     for dataset in datasets:
         dset_dir = base / dataset
         if not (dset_dir / "articles.parquet").exists():
-            log.warning("%s: no articles.parquet, skipping", dataset)
-            continue
+            raise ValueError(
+                f"requested dataset '{dataset}' is missing articles.parquet "
+                f"(expected at {dset_dir / 'articles.parquet'})"
+            )
         arts = read_df(dset_dir / "articles.parquet")
         p_lookup, id_to_cat, catalog_set, catalog_cats = _build_popularity(arts)
         impr = read_df(dset_dir / "impressions.parquet").with_row_index(IMPRESSION_ROW_ID)

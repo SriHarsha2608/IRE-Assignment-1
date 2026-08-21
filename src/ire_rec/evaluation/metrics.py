@@ -55,7 +55,8 @@ def ndcg_at_k_from_ranked(ranked_labels: list[int], k: int):
     disc = np.log2(np.arange(1, eff + 1) + 1.0)
     dcg = float(np.sum(gains / disc))
     n_pos = int(rl.sum())
-    idcg = float(np.sum(np.ones(n_pos) / np.log2(np.arange(1, n_pos + 1) + 1.0)))
+    ideal_pos = min(n_pos, k)
+    idcg = float(np.sum(1.0 / np.log2(np.arange(1, ideal_pos + 1) + 1.0)))
     return dcg / idcg
 
 
