@@ -93,13 +93,13 @@ def _fuse_row(inview, bm25_c, bm25_s, sem_c, sem_s, w_bm25, w_sem) -> list[str]:
 
 
 def _sem_emb(dataset: str, embedding: str | None, config: dict[str, Any]) -> str:
-    if dataset == "MIND":
-        return "entity_mean"  # MIND only has entity_mean semantic embeddings
+    if dataset.startswith("MIND"):
+        return "entity_mean"  # MIND (incl. MIND-large) only has entity_mean semantic embeddings
     return embedding or config.get("retrieval", {}).get("semantic", {}).get("embedding", "word2vec")
 
 
 def _fmt_for(dataset: str) -> str:
-    return "mind" if dataset == "MIND" else "ebnerd"
+    return "mind" if dataset.startswith("MIND") else "ebnerd"
 
 
 def _write_predictions(out_file: Path, rows: list[tuple[str, list[str]]], fmt: str) -> None:

@@ -400,3 +400,23 @@ def test_run_semantic_partial_run_does_not_mix_stale_splits(tmp_path):
     assert not (out_dir / "candidates_test.parquet").exists()
     # the current val file reflects exactly the limited invocation
     assert pl.read_parquet(out_dir / "candidates_val.parquet").height == 1
+
+def test_embedding_dir_routing_mind_and_large(tmp_path):
+    from ire_rec.retrieval.run_semantic import _embedding_dir
+
+    cfg = {
+        "paths": {"processed_dir": str(tmp_path / "proc")},
+        "retrieval": {"semantic": {"embedding": "word2vec"}},
+    }
+    # MIND (small) -> entity_mean under its own dataset dir
+    d, name = _embedding_dir(cfg, "MIND", None)
+    assert name == "entity_mean"
+    assert d.name == "embeddings" and d.parent.name == "MIND"
+    # MIND-large -> entity_mean under MIND-large dir (not the shared EB-NeRD dir)
+    d2, name2 = _embedding_dir(cfg, "MIND-large", None)
+    assert name2 == "entity_mean"
+    assert d2.parent.name == "MIND-large"
+    # EB-NeRD-large -> shared EB-NeRD embeddings with the configured embedding
+    d3, name3 = _embedding_dir(cfg, "EB-NeRD-large", None)
+    assert name3 == "word2vec"
+    assert d3.parent.name == "EB-NeRD" and d3.name == "embeddings"

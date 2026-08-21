@@ -27,8 +27,8 @@ log = logging.getLogger(__name__)
 
 def _embedding_dir(cfg: dict, dataset: str, embedding: str | None) -> tuple[Path, str]:
     """Return (embeddings dir, embedding name) for a dataset."""
-    if dataset == "MIND":
-        return processed_dir(cfg) / "MIND" / "embeddings", "entity_mean"
+    if dataset.startswith("MIND"):
+        return processed_dir(cfg) / dataset / "embeddings", "entity_mean"
     name = embedding or cfg["retrieval"]["semantic"].get("embedding", "word2vec")
     return processed_dir(cfg) / "EB-NeRD" / "embeddings", name
 

@@ -442,8 +442,8 @@ def test_pipeline_orchestration_config_change_triggers_rebuild(monkeypatch, tmp_
     dummy.write_bytes(b"rawdata")
     raw_fp = bp.download.fingerprint(dummy)
 
-    def fake_build_mind(cfg_, force, redownload):
-        proc = bp.config.processed_dir(cfg_) / "MIND"
+    def fake_build_mind(cfg_, key, force, redownload):
+        proc = bp.config.processed_dir(cfg_) / key
         emb = proc / "embeddings"
         emb.mkdir(parents=True, exist_ok=True)
         pl.DataFrame(
@@ -475,9 +475,9 @@ def test_pipeline_orchestration_config_change_triggers_rebuild(monkeypatch, tmp_
 
     calls = {"n": 0}
 
-    def counting_build_mind(cfg_, force, redownload):
+    def counting_build_mind(cfg_, key, force, redownload):
         calls["n"] += 1
-        return fake_build_mind(cfg_, force, redownload)
+        return fake_build_mind(cfg_, key, force, redownload)
 
     monkeypatch.setattr(bp.config, "load_config", lambda: cfg)
     monkeypatch.setattr(bp, "build_mind", counting_build_mind)
@@ -540,8 +540,8 @@ def test_pipeline_per_stage_config_hash_invalidation(monkeypatch, tmp_path):
         ).write_parquet(dset_dir / "impressions.parquet")
         pl.DataFrame({"article_id": ["E1"]}).write_parquet(dset_dir / "history.parquet")
 
-    def fake_build_mind(cfg_, force, redownload):
-        dset = proc / "MIND"
+    def fake_build_mind(cfg_, key, force, redownload):
+        dset = proc / key
         emb = dset / "embeddings"
         emb.mkdir(parents=True, exist_ok=True)
         pl.DataFrame({"article_id": ["N1"], "title": ["t"], "abstract": ["a"]}).write_parquet(
@@ -645,3 +645,108 @@ def test_pipeline_per_stage_config_hash_invalidation(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "argv", ["ire_rec.build_pipeline", "--datasets", "all"])
     bp.main()
     assert calls == {"mind": 2, "demo": 2, "small": 2, "emb": 2}
+
+
+# ---------------------------------------------------------------------------
+# Q5 / Large-dataset support (structural; no real Large data required)
+# ---------------------------------------------------------------------------
+def test_dataset_spec_mind_small_vs_large_distinct():
+    import ire_rec.build_pipeline as bp
+    from ire_rec.build_pipeline import dataset_spec
+
+    cfg = bp.config.load_config()
+    s_small = dataset_spec(cfg, "MIND")
+    s_large = dataset_spec(cfg, "MIND-large")
+    # MIND and MIND-large share the raw dir but have distinct output dirs/archives
+    assert s_small["raw_root"] == s_large["raw_root"]
+    assert s_small["proc"] != s_large["proc"]
+    assert s_small["proc"].name == "MIND"
+    assert s_large["proc"].name == "MIND-large"
+    assert "MINDsmall_train.zip" in s_small["archives"]
+    assert "MINDlarge_train.zip" in s_large["archives"]
+    assert s_small["archives"] != s_large["archives"]
+    assert s_small["embeddings"][0] == "entity_mean"
+
+
+def test_dataset_spec_ebnerd_small_vs_large_distinct():
+    import ire_rec.build_pipeline as bp
+    from ire_rec.build_pipeline import dataset_spec
+
+    cfg = bp.config.load_config()
+    e_small = dataset_spec(cfg, "EB-NeRD-small")
+    e_large = dataset_spec(cfg, "EB-NeRD-large")
+    assert e_small["proc"].name == "EB-NeRD-small"
+    assert e_large["proc"].name == "EB-NeRD-large"
+    assert e_small["proc"] != e_large["proc"]
+    assert e_small["archives"][0] == "ebnerd_small.zip"
+    assert e_large["archives"][0] == "ebnerd_large.zip"
+    # EB-NeRD embeddings are shared (EB-NeRD/embeddings), not per-bundle
+    assert e_small["embeddings"][1] == e_large["embeddings"][1]
+    assert e_small["embeddings"][1].name == "embeddings"
+
+
+def test_missing_mind_large_archives_clear_error(monkeypatch):
+    import urllib.error
+
+    import ire_rec.build_pipeline as bp
+
+    cfg = bp.config.load_config()
+
+    def boom(*a, **k):
+        raise urllib.error.URLError("401 GatedRepo")
+
+    monkeypatch.setattr(bp.download, "ensure_file", boom)
+    with pytest.raises(RuntimeError) as exc:
+        bp.build_mind(cfg, "MIND-large", False, False)
+    msg = str(exc.value)
+    assert "MINDlarge_train.zip" in msg
+    assert "gated" in msg.lower() or "Hugging Face" in msg
+
+
+def test_missing_ebnerd_large_archives_clear_error(monkeypatch):
+    import urllib.error
+
+    import ire_rec.build_pipeline as bp
+
+    cfg = bp.config.load_config()
+
+    def boom(*a, **k):
+        raise urllib.error.URLError("not found")
+
+    monkeypatch.setattr(bp.download, "ensure_file", boom)
+    with pytest.raises(RuntimeError) as exc:
+        bp.build_ebnerd_bundle(cfg, "large", False, False)
+    msg = str(exc.value)
+    assert "ebnerd_large.zip" in msg
+
+
+def test_large_cache_isolation(tmp_path):
+    from ire_rec.build_pipeline import MIND_OUTPUT_FILES, _config_signature, _up_to_date
+
+    cfg = _minimal_cfg(tmp_path)
+    mind_base = Path(cfg["paths"]["processed_dir"]) / "MIND"
+    large_base = Path(cfg["paths"]["processed_dir"]) / "MIND-large"
+    for base in (mind_base, large_base):
+        base.mkdir(parents=True)
+        for f in MIND_OUTPUT_FILES:
+            p = base / f
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(b"x")
+    fp_small = {"MINDsmall_train.zip": "fp1", "MINDsmall_dev.zip": "fp2"}
+    fp_large = {"MINDlarge_train.zip": "fpl1", "MINDlarge_dev.zip": "fpl2"}
+    manifest = {
+        "version": "2",
+        "MIND": {"fingerprints": fp_small, "config_hash": _config_signature(cfg)},
+        "MIND-large": {"fingerprints": fp_large, "config_hash": _config_signature(cfg)},
+    }
+    # each key is up to date only under its own fingerprints / output dir
+    assert _up_to_date(cfg, manifest, "MIND", fp_small, files=MIND_OUTPUT_FILES) is True
+    assert _up_to_date(cfg, manifest, "MIND", fp_large, files=MIND_OUTPUT_FILES) is False
+    assert _up_to_date(cfg, manifest, "MIND-large", fp_large, files=MIND_OUTPUT_FILES) is True
+    assert _up_to_date(cfg, manifest, "MIND-large", fp_small, files=MIND_OUTPUT_FILES) is False
+    # a present MIND (small) cache must NOT satisfy MIND-large
+    small_only = {
+        "version": "2",
+        "MIND": {"fingerprints": fp_small, "config_hash": _config_signature(cfg)},
+    }
+    assert _up_to_date(cfg, small_only, "MIND-large", fp_large, files=MIND_OUTPUT_FILES) is False

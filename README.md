@@ -53,6 +53,44 @@ python -m ire_rec.build_pipeline --datasets MIND,EB-NeRD-demo
 python -m ire_rec.build_pipeline --rebuild --skip-embeddings   # rebuild without the heavy BERT consolidation
 ```
 
+## Large datasets (Codabench submissions)
+
+The default `make data` / `make pipeline` builds only the **small** subsets
+(`MINDsmall`, `EB-NeRD-demo`, `EB-NeRD-small`) used for local development. The
+Codabench competitions require the **Large** subsets:
+
+- **MIND (Codabench 13967)** → `MIND-large` (`MINDlarge_train.zip`, `MINDlarge_dev.zip`)
+- **EB-NeRD / RecSys 2024 (Codabench 2469)** → `EB-NeRD-large` (`ebnerd_large.zip`)
+
+Support is wired but **opt-in** — these are never built by `make data` or by the
+default `--datasets all`. Request them explicitly:
+
+```bash
+python -m ire_rec.build_pipeline --datasets MIND-large
+python -m ire_rec.build_pipeline --datasets EB-NeRD-large
+python -m ire_rec.make_predictions --datasets MIND-large,EB-NeRD-large --out predictions/large
+```
+
+Caveats:
+
+- **MIND Large is GATED on Hugging Face** (`yjw1029/MIND`, `MIND-Large`). You must
+  run it on a machine where you have authenticated access (`huggingface-cli login`
+  with a MIND license). The pipeline fails with a clear "gated" error rather than
+  bypassing auth or downloading an unrelated mirror. The `downloads.MIND_large` URL
+  in `configs/default.yaml` is the official gated repo.
+- **EB-NeRD Large is far larger than this 11 GB laptop environment.** It is
+  supported (config + shared `EB-NeRD/embeddings` stage), but running it locally
+  here is not feasible — use a capable machine.
+- Each Large dataset has its **own** manifest entry and output directory
+  (`data/processed/MIND-large`, `data/processed/EB-NeRD-large`); a small subset's
+  cache never satisfies a Large run and vice versa.
+- MIND embeddings stay `entity_mean` (Wikidata entity mean-pool); EB-NeRD Large
+  uses the configured `retrieval.semantic.embedding` (default `word2vec`).
+
+This environment only executed the small subsets end-to-end; Large runs are
+structural-only (config + routing + tests) unless run on a suitably provisioned
+machine.
+
 ## Deliverables map (Q1-Q9)
 
 | Q | Item | Location |

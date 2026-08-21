@@ -1,3 +1,4 @@
+import json
 import polars as pl
 import pytest
 
@@ -135,3 +136,18 @@ def test_meta_written(tmp_path):
     assert meta["format"] == "mind"
     assert meta["embedding"] == "entity_mean"
     assert meta["n_impressions"] == 1
+
+
+def test_mind_large_routes_to_entity_mean_and_mind_format(tmp_path):
+    _write_dataset(
+        tmp_path, "MIND-large",
+        [{IMP_ID: "i0", INVIEW: ["a", "b"], SPLIT: "test"}],
+        bm25=[{RID: 0, CAND: ["a"], SCORES: [1.0]}],
+    )
+    out = _run(tmp_path, ["MIND-large"])
+    f = out / "MIND-large" / "prediction.txt"
+    lines = f.read_text().strip().split("\n")
+    assert "\t" in lines[0] and lines[0].split("\t")[1] == "a b"
+    meta = json.loads((out / "MIND-large" / "meta.json").read_text())
+    assert meta["format"] == "mind"
+    assert meta["embedding"] == "entity_mean"

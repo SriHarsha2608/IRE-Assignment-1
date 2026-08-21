@@ -11,12 +11,16 @@ dataset_defaults:
   MIND:
     version: MINDsmall
     archives: [MINDsmall_train.zip, MINDsmall_dev.zip]
+  MIND-large:
+    version: MINDlarge
+    archives: [MINDlarge_train.zip, MINDlarge_dev.zip]
   EB-NeRD:
     version: "2024"
-    bundles: [demo, small]
+    bundles: [demo, small, large]
     archives:
       demo: ebnerd_demo.zip
       small: ebnerd_small.zip
+      large: ebnerd_large.zip
     embeddings:
       word2vec: artifacts/Ekstra_Bladet_word2vec.zip
       bert: artifacts/google_bert_base_multilingual_cased.zip

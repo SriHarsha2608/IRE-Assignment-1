@@ -108,18 +108,82 @@ def _require_mind_entity_vectors(emb_parts: list[dict], archives: list[str]) -> 
         )
 
 
-def build_mind(cfg: dict, force: bool, redownload: bool) -> dict:
-    base = cfg["downloads"]["MIND"]
-    raw_root = config.raw_dir(cfg) / "MIND"
-    proc = config.processed_dir(cfg) / "MIND"
-    archives = cfg["dataset_defaults"]["MIND"]["archives"]
+def dataset_spec(cfg: dict, name: str) -> dict:
+    """Central dataset configuration mapping (single source of truth).
 
-    fingerprints = {}
-    for arch in archives:
-        download.ensure_file(base + "/" + arch, raw_root / arch, force=redownload)
-        fingerprints[arch] = download.fingerprint(raw_root / arch)
+    Resolves a dataset key to its kind, raw directory, processed output
+    directory, raw archive filename(s), and embedding location, so dataset-
+    specific path logic is not scattered across the pipeline."""
+    if name.startswith("MIND"):
+        dd = cfg["dataset_defaults"][name]
+        return {
+            "kind": "mind",
+            "raw_root": config.raw_dir(cfg) / "MIND",
+            "proc": config.processed_dir(cfg) / name,
+            "archives": list(dd["archives"]),
+            "embeddings": ("entity_mean", config.processed_dir(cfg) / name / "embeddings"),
+        }
+    if name == "EB-NeRD-embeddings":
+        return {
+            "kind": "ebnerd-embeddings",
+            "proc": config.processed_dir(cfg) / "EB-NeRD" / "embeddings",
+        }
+    if name.startswith("EB-NeRD-"):
+        bundle = name.split("EB-NeRD-", 1)[1]
+        dd = cfg["dataset_defaults"]["EB-NeRD"]
+        return {
+            "kind": "ebnerd",
+            "raw_root": config.raw_dir(cfg) / "EB-NeRD",
+            "proc": config.processed_dir(cfg) / name,
+            "archives": [dd["archives"][bundle]],
+            "embeddings": ("shared", config.processed_dir(cfg) / "EB-NeRD" / "embeddings"),
+        }
+    raise ValueError(f"unknown dataset key: {name}")
 
-    tmp = config.temp_dir(cfg) / "mind"
+
+def _gated_hint(label: str) -> str:
+    if label.startswith("MIND"):
+        return (
+            " The official MIND dataset on Hugging Face (yjw1029/MIND) is gated: "
+            "obtain access, authenticate externally (e.g. `huggingface-cli login`), "
+            "and place the official archive(s) in the raw directory, then re-run. "
+            "Do not substitute an unrelated mirror for the official assignment dataset."
+        )
+    return " Supply the official raw archive in the raw directory, then re-run."
+
+
+def _ensure_archives(cfg: dict, spec: dict, force: bool, redownload: bool, label: str) -> dict:
+    """Download/verify raw archives for a dataset spec, failing clearly.
+
+    Authentication/data availability is treated as an external prerequisite: if an
+    archive is missing and cannot be fetched, raise a RuntimeError with an
+    actionable message (including the gated-dataset note for MIND)."""
+    base = cfg["downloads"]["MIND"] if spec["kind"] == "mind" else cfg["downloads"]["EB-NeRD"]
+    raw_root = spec["raw_root"]
+    fps: dict[str, int] = {}
+    for arch in spec["archives"]:
+        dest = raw_root / arch
+        try:
+            download.ensure_file(base + "/" + arch, dest, force=redownload)
+        except Exception as e:  # network/HTTP/IO failure -> actionable error
+            raise RuntimeError(
+                f"Required raw archive '{arch}' for {label} is missing from "
+                f"{raw_root} and could not be downloaded ({type(e).__name__}: {e})."
+                + _gated_hint(label)
+            ) from e
+        fps[arch] = download.fingerprint(dest)
+    return fps
+
+
+def build_mind(cfg: dict, key: str, force: bool, redownload: bool) -> dict:
+    spec = dataset_spec(cfg, key)
+    raw_root = spec["raw_root"]
+    proc = spec["proc"]
+    archives = spec["archives"]
+
+    fingerprints = _ensure_archives(cfg, spec, force, redownload, label=key)
+
+    tmp = config.temp_dir(cfg) / f"mind_{key}"
     clean_dir(tmp)
     for arch in archives:
         unzip(raw_root / arch, tmp / arch.replace(".zip", ""))
@@ -200,13 +264,12 @@ def build_mind(cfg: dict, force: bool, redownload: bool) -> dict:
 
 
 def build_ebnerd_bundle(cfg: dict, bundle: str, force: bool, redownload: bool) -> dict:
-    base = cfg["downloads"]["EB-NeRD"]
-    arch = cfg["dataset_defaults"]["EB-NeRD"]["archives"][bundle]
-    raw_path = config.raw_dir(cfg) / "EB-NeRD" / arch
-    download.ensure_file(base + "/" + arch, raw_path, force=redownload)
-    fingerprints = {arch: download.fingerprint(raw_path)}
+    key = f"EB-NeRD-{bundle}"
+    spec = dataset_spec(cfg, key)
+    raw_path = spec["raw_root"] / spec["archives"][0]
+    fingerprints = _ensure_archives(cfg, spec, force, redownload, label=key)
 
-    proc = config.processed_dir(cfg) / f"EB-NeRD-{bundle}"
+    proc = config.processed_dir(cfg) / key
     tmp = config.temp_dir(cfg) / f"ebnerd_{bundle}"
     clean_dir(tmp)
     unzip(raw_path, tmp / bundle)
@@ -292,7 +355,10 @@ def main() -> None:
     parser.add_argument(
         "--datasets",
         default="all",
-        help="comma-separated subset of {MIND, EB-NeRD-demo, EB-NeRD-small}",
+        help="comma-separated subset (default 'all' = MIND, EB-NeRD-demo, "
+             "EB-NeRD-small). Large variants MIND-large / EB-NeRD-large are "
+             "supported but must be requested explicitly (MIND Large is gated "
+             "on Hugging Face; EB-NeRD Large needs substantial memory).",
     )
     parser.add_argument(
         "--skip-embeddings",
@@ -323,17 +389,35 @@ def main() -> None:
     manifest.setdefault("version", VERSION)
     started = time.time()
 
-    if build_all or "MIND" in wanted:
-        if args.rebuild or not _up_to_date(
-            cfg, manifest, "MIND", _mind_fp(cfg), files=MIND_OUTPUT_FILES
-        ):
-            log.info("building MIND")
-            manifest["MIND"] = build_mind(cfg, args.rebuild, args.redownload)
-            _write_manifest(manifest_path, manifest, cfg, "MIND")
-        else:
-            log.info("MIND up to date (use --rebuild to force)")
+    # MIND family. The default "all" builds only MIND (small); Large is gated
+    # and must be requested explicitly (e.g. --datasets MIND-large). This avoids
+    # silently attempting the gated download or an oversized run.
+    mind_keys = ["MIND", "MIND-large"]
+    if build_all:
+        requested_mind = ["MIND"]
+    else:
+        requested_mind = [k for k in mind_keys if k in wanted]
 
-    wants_ebnerd = build_all or any(k.startswith("EB-NeRD") for k in wanted or ())
+    for key in requested_mind:
+        if args.rebuild or not _up_to_date(
+            cfg, manifest, key, _mind_fp(cfg, key), files=MIND_OUTPUT_FILES
+        ):
+            log.info("building %s", key)
+            manifest[key] = build_mind(cfg, key, args.rebuild, args.redownload)
+            _write_manifest(manifest_path, manifest, cfg, key)
+        else:
+            log.info("%s up to date (use --rebuild to force)", key)
+
+    # EB-NeRD family. Default "all" builds demo + small only; "large" is
+    # supported but must be requested explicitly (it needs far more memory than
+    # this environment provides).
+    ebnerd_bundles = ["demo", "small", "large"]
+    if build_all:
+        active_bundles = ["demo", "small"]
+    else:
+        active_bundles = [b for b in ebnerd_bundles if f"EB-NeRD-{b}" in wanted]
+
+    wants_ebnerd = build_all or any(f"EB-NeRD-{b}" in (wanted or ()) for b in ebnerd_bundles)
     if wants_ebnerd and not args.skip_embeddings:
         key = EMBEDDINGS_KEY
         build_emb = build_all or (wanted and "EB-NeRD-embeddings" in wanted)
@@ -347,17 +431,18 @@ def main() -> None:
             base_dir=emb_base,
         )
         # Rebuild embeddings when requested, when this stage's own outputs are
-        # stale/missing (e.g. a deleted .npy/_ids.parquet), or when any bundle
-        # needs rebuilding and the embedding stage may therefore be incomplete.
+        # stale/missing, or when any active bundle needs rebuilding (so the
+        # shared embedding stage is not left incomplete for that bundle).
         if build_emb or not emb_up_to_date or any(
-            not _up_to_date(cfg, manifest, b, _ebnerd_fp(cfg, b)) for b in ("demo", "small")
+            not _up_to_date(cfg, manifest, f"EB-NeRD-{b}", _ebnerd_fp(cfg, b))
+            for b in active_bundles
         ):
             if args.rebuild or not emb_up_to_date:
                 log.info("building EB-NeRD article embeddings")
                 manifest[key] = build_ebnerd_embeddings(cfg, args.rebuild, args.redownload)
                 _write_manifest(manifest_path, manifest, cfg, key)
 
-    for bundle in ("demo", "small"):
+    for bundle in active_bundles:
         key = f"EB-NeRD-{bundle}"
         if build_all or key in wanted:
             if args.rebuild or not _up_to_date(cfg, manifest, key, _ebnerd_fp(cfg, bundle)):
@@ -375,10 +460,10 @@ def main() -> None:
     log.info("all done in %.1fs", time.time() - started)
 
 
-def _mind_fp(cfg: dict) -> dict:
+def _mind_fp(cfg: dict, key: str = "MIND") -> dict:
     raw = config.raw_dir(cfg) / "MIND"
     out = {}
-    for arch in cfg["dataset_defaults"]["MIND"]["archives"]:
+    for arch in cfg["dataset_defaults"][key]["archives"]:
         p = raw / arch
         if p.exists():
             out[arch] = download.fingerprint(p)
