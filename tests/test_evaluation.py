@@ -1,15 +1,20 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import pytest
 
+from ire_rec.dataio import IMPRESSION_ROW_ID
 from ire_rec.evaluation import metrics as M
 from ire_rec.evaluation.run_eval import (
     _build_popularity,
     _determine_ranking,
+    _select_candidate_rows,
     _validate,
     evaluate_candidates,
+    run_eval,
 )
 
 
@@ -324,3 +329,179 @@ def test_evaluate_no_positive_labels():
     assert res["metrics"]["mrr"]["value"] is None
     # beyond-accuracy still computed
     assert res["beyond_accuracy"]["intra_list_diversity"]["value"] is not None
+
+
+# ---------------------------------------------------------------------------
+# extended validation (spec 1 A-E)
+# ---------------------------------------------------------------------------
+def _build_case(impr_data: dict, cand_data: list, arts=None):
+    if arts is None:
+        arts = pl.DataFrame({
+            "article_id": ["a", "b", "c", "d", "e"],
+            "category": ["cat1", "cat1", "cat2", "cat2", "cat2"],
+            "n_inviews": [100.0, 10.0, 1.0, 5.0, 2.0],
+            "n_clicks": [50.0, 5.0, 0.0, 2.0, 1.0],
+        })
+    p_lookup, id_to_cat, cs, cc = _build_popularity(arts)
+    impr = pl.DataFrame(impr_data).with_columns(
+        pl.col("history").cast(pl.List(pl.String))
+    )
+    cand = _cand_df(cand_data)
+    return cand, impr, p_lookup, id_to_cat, cs, cc
+
+
+def test_validate_inview_labels_length_mismatch():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["a", "b"]],
+         "labels": [[1, 0, 0]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "gt_clicked": ["a"], "candidates": ["a"], "scores": [0.5], "n_query_terms": 1}],
+    )
+    with pytest.raises(ValueError):
+        evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+def test_validate_gt_clicked_mismatch():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["a", "b"]],
+         "labels": [[1, 0]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "gt_clicked": ["b"], "candidates": ["a"], "scores": [0.5], "n_query_terms": 1}],
+    )
+    with pytest.raises(ValueError):
+        evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+def test_validate_candidate_id_not_in_catalog():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["z"]],
+         "labels": [[1]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "gt_clicked": ["z"], "candidates": ["z"], "scores": [0.5], "n_query_terms": 1}],
+    )
+    with pytest.raises(ValueError):
+        evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+def test_validate_duplicate_candidate_ids():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["a", "b"]],
+         "labels": [[0, 0]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "gt_clicked": [], "candidates": ["a", "a"], "scores": [0.5, 0.5], "n_query_terms": 1}],
+    )
+    with pytest.raises(ValueError):
+        evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+def test_validate_nonfinite_score():
+    cand, impr, p, ic, cs, cc = _build_case(
+        {"impression_row_id": [0], "impression_id": ["I0"], "inview": [["a"]],
+         "labels": [[1]], "history": [["x"]]},
+        [{"impression_row_id": 0, "impression_id": "I0", "split": "val",
+          "gt_clicked": ["a"], "candidates": ["a"], "scores": [float("nan")], "n_query_terms": 1}],
+    )
+    with pytest.raises(ValueError):
+        evaluate_candidates(cand, impr, p, ic, cs, cc, 20, 1, "val")
+
+
+def test_select_candidate_rows_deterministic_by_row_id():
+    rows = [
+        {"impression_row_id": 10, "impression_id": "i", "split": "val",
+         "gt_clicked": [], "candidates": ["a"], "scores": [0.5], "n_query_terms": 1},
+        {"impression_row_id": 3, "impression_id": "i", "split": "val",
+         "gt_clicked": [], "candidates": ["a"], "scores": [0.5], "n_query_terms": 1},
+        {"impression_row_id": 7, "impression_id": "i", "split": "val",
+         "gt_clicked": [], "candidates": ["a"], "scores": [0.5], "n_query_terms": 1},
+        {"impression_row_id": 1, "impression_id": "i", "split": "val",
+         "gt_clicked": [], "candidates": ["a"], "scores": [0.5], "n_query_terms": 1},
+    ]
+    cand = _cand_df(rows)
+    sel = _select_candidate_rows(cand, 2)
+    assert sel[IMPRESSION_ROW_ID].to_list() == [1, 3]
+
+
+def test_slice_contains_coverage_metrics():
+    cand, impr, p_lookup, id_to_cat, cs, cc = _make_inputs()
+    res = evaluate_candidates(cand, impr, p_lookup, id_to_cat, cs, cc, 50, 42, "val")
+    sl = res["slices"]["cold_start_vs_warm"]
+    for part in ("cold", "warm"):
+        for k in ("article_coverage", "category_coverage"):
+            assert sl[part][k]["value"] is not None
+            assert sl[part][k]["ci_low"] is not None
+            assert sl[part][k]["ci_high"] is not None
+
+
+# ---------------------------------------------------------------------------
+# method discovery failures (spec 3)
+# ---------------------------------------------------------------------------
+def _write_tmp_dataset(base: Path, name: str, with_bm25=True,
+                       with_sem_entity=True, with_bert=False):
+    dset = base / name
+    dset.mkdir(parents=True, exist_ok=True)
+    arts = pl.DataFrame({
+        "article_id": ["a", "b", "c", "d", "e"],
+        "category": ["cat1", "cat1", "cat2", "cat2", "cat2"],
+        "n_inviews": [100.0, 10.0, 1.0, 5.0, 2.0],
+        "n_clicks": [50.0, 5.0, 0.0, 2.0, 1.0],
+    })
+    arts.write_parquet(dset / "articles.parquet")
+    impr = pl.DataFrame({
+        "impression_id": ["I0"],
+        "inview": [["a", "b", "c"]],
+        "labels": [[1, 0, 0]],
+        "history": [["x"]],
+    }).with_columns(pl.col("history").cast(pl.List(pl.String)))
+    impr.write_parquet(dset / "impressions.parquet")
+    schema = {
+        "impression_row_id": pl.UInt32,
+        "impression_id": pl.String,
+        "split": pl.String,
+        "gt_clicked": pl.List(pl.String),
+        "candidates": pl.List(pl.String),
+        "scores": pl.List(pl.Float64),
+        "n_query_terms": pl.Int32,
+    }
+
+    def _write(subdir: str):
+        d = dset / "retrieval" / subdir
+        d.mkdir(parents=True, exist_ok=True)
+        pl.DataFrame([{
+            "impression_row_id": 0, "impression_id": "I0", "split": "val",
+            "gt_clicked": ["a"], "candidates": ["a"], "scores": [0.5],
+            "n_query_terms": 1,
+        }], schema=schema).write_parquet(d / "candidates_val.parquet")
+
+    if with_bm25:
+        _write("bm25")
+    if with_sem_entity:
+        _write("semantic/entity_mean")
+    if with_bert:
+        _write("semantic/bert")
+    return dset
+
+
+def _tmp_cfg(base: Path, runs=20):
+    return {
+        "paths": {"raw_dir": "x", "processed_dir": str(base)},
+        "evaluation": {"bootstrap_runs": runs, "bootstrap_seed": 1},
+    }
+
+
+def test_discovery_missing_requested_method_fails(tmp_path):
+    _write_tmp_dataset(tmp_path, "D")
+    with pytest.raises(ValueError):
+        run_eval(_tmp_cfg(tmp_path), ["D"], ("val",), methods_filter=["semantic_bert"])
+
+
+def test_discovery_present_requested_method_ok(tmp_path):
+    _write_tmp_dataset(tmp_path, "D")
+    res = run_eval(_tmp_cfg(tmp_path), ["D"], ("val",), methods_filter=["bm25"])
+    assert "bm25_val" in res["D"]
+
+
+def test_discovery_no_candidates_fails(tmp_path):
+    _write_tmp_dataset(tmp_path, "D", with_bm25=False,
+                       with_sem_entity=False, with_bert=False)
+    with pytest.raises(ValueError):
+        run_eval(_tmp_cfg(tmp_path), ["D"], ("val",))

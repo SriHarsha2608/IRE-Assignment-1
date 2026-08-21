@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import time
 from pathlib import Path
 from typing import Any
@@ -91,6 +92,61 @@ def _validate(cand: pl.DataFrame, split: str) -> None:
         raise ValueError("candidate row has len(candidates) != len(scores)")
 
 
+def _validate_joined(joined: pl.DataFrame, catalog_set: set, split: str) -> None:
+    """Validation that requires the joined impressions (invariants A-E).
+
+    Done with a single memory-bounded row iteration (no ``explode`` of the
+    large candidate list columns) so it stays practical on the full corpus.
+    Empty candidate lists (cold-start semantic rows) are valid and skipped.
+    """
+    # A. inview / labels present and equal length
+    if INVIEW not in joined.columns or joined["inview"].null_count() > 0:
+        raise ValueError(
+            "candidate row(s) have no matching impression (inview missing/null)"
+        )
+    if LABELS not in joined.columns or joined["labels"].null_count() > 0:
+        raise ValueError(
+            "candidate row(s) have no matching impression (labels missing/null)"
+        )
+    len_ok = joined.select(
+        (pl.col(INVIEW).list.len() == pl.col(LABELS).list.len()).alias("_eq")
+    )
+    if not len_ok["_eq"].all():
+        raise ValueError("impression inview/labels length mismatch")
+
+    # Per-row invariants (C, D, E, B)
+    for row in joined.iter_rows(named=True):
+        inv = row[INVIEW]
+        lab = row[LABELS]
+        cands = row["candidates"]
+        scores = row["scores"]
+        gt = row.get("gt_clicked")
+
+        # C. every candidate id must exist in the catalog
+        for c in cands:
+            if c not in catalog_set:
+                raise ValueError(f"candidate article ID not in catalog: {c!r}")
+
+        # D. candidate ids unique within each impression
+        if len(set(cands)) != len(cands):
+            raise ValueError("candidate row has duplicate candidate article IDs")
+
+        # E. scores finite
+        for s in scores:
+            if s is None or not math.isfinite(s):
+                raise ValueError("candidate scores contain NaN/Inf (must be finite)")
+
+        # B. gt_clicked must equal click-derived ground truth (insertion order,
+        # exactly matching Q2/Q3: [aid for aid, lab in zip(inview, labels) if lab == 1]).
+        if gt is not None:
+            derived = [a for a, l in zip(inv, [int(x) for x in lab]) if l == 1]
+            if derived != gt:
+                raise ValueError(
+                    "candidate gt_clicked does not match click-derived ground truth "
+                    "(inview/labels)"
+                )
+
+
 def _determine_ranking(inview, labels, cand_ids, cand_scores):
     """Deterministic INVIEW ranking (spec section 4).
 
@@ -127,7 +183,6 @@ def evaluate_candidates(
     bootstrap_runs: int,
     seed: int,
     split: str,
-    top_k_beyond: int | None = None,
 ) -> dict:
     """Core evaluation of one candidate file against impressions.
 
@@ -136,17 +191,13 @@ def evaluate_candidates(
     """
     _validate(cand, split)
 
-    # Limit deterministically (head by current order = stable impression_row_id).
     hist = _history_len(impr)
     impr_small = impr.select(
         [IMPRESSION_ROW_ID, INVIEW, LABELS]
     ).join(hist, on=IMPRESSION_ROW_ID, how="left")
 
     joined = cand.join(impr_small, on=IMPRESSION_ROW_ID, how="left")
-    if joined["inview"].null_count() > 0:
-        raise ValueError(
-            "candidate row(s) have no matching impression via impression_row_id"
-        )
+    _validate_joined(joined, catalog_set, split)
 
     auc_vals: list[float] = []
     mrr_vals: list[float] = []
@@ -156,6 +207,10 @@ def evaluate_candidates(
     nov_vals: list[float] = []
     rec_sets: list[set] = []
     rec_cat_sets: list[set] = []
+    cold_rec_sets: list[set] = []
+    cold_rec_cat_sets: list[set] = []
+    warm_rec_sets: list[set] = []
+    warm_rec_cat_sets: list[set] = []
     cold_auc: list[float] = []
     cold_mrr: list[float] = []
     cold_n5: list[float] = []
@@ -227,9 +282,13 @@ def evaluate_candidates(
         if nh == 0:
             cold_div.append(div)
             cold_nov.append(nov)
+            cold_rec_sets.append(cset)
+            cold_rec_cat_sets.append(ccats)
         else:
             warm_div.append(div)
             warm_nov.append(nov)
+            warm_rec_sets.append(cset)
+            warm_rec_cat_sets.append(ccats)
 
     # Cold/warm impression counts (counted once, per impression).
     n_cold = int((joined["n_history"] == 0).sum())
@@ -259,6 +318,12 @@ def evaluate_candidates(
                 "ndcg@10": bootstrap_mean_ci(cold_n10, bootstrap_runs, seed),
                 "intra_list_diversity": bootstrap_mean_ci(cold_div, bootstrap_runs, seed),
                 "novelty": bootstrap_mean_ci(cold_nov, bootstrap_runs, seed),
+                "article_coverage": bootstrap_coverage_ci(
+                    cold_rec_sets, len(catalog_set), bootstrap_runs, seed
+                ),
+                "category_coverage": bootstrap_coverage_ci_cats(
+                    cold_rec_cat_sets, len(catalog_cats), bootstrap_runs, seed
+                ),
             },
             "warm": {
                 "n": n_warm,
@@ -268,6 +333,12 @@ def evaluate_candidates(
                 "ndcg@10": bootstrap_mean_ci(warm_n10, bootstrap_runs, seed),
                 "intra_list_diversity": bootstrap_mean_ci(warm_div, bootstrap_runs, seed),
                 "novelty": bootstrap_mean_ci(warm_nov, bootstrap_runs, seed),
+                "article_coverage": bootstrap_coverage_ci(
+                    warm_rec_sets, len(catalog_set), bootstrap_runs, seed
+                ),
+                "category_coverage": bootstrap_coverage_ci_cats(
+                    warm_rec_cat_sets, len(catalog_cats), bootstrap_runs, seed
+                ),
             },
         }
     }
@@ -293,6 +364,18 @@ def _discover_methods(dset_dir: Path, split: str) -> list[tuple[str, str | None,
     return out
 
 
+def _select_candidate_rows(cand: pl.DataFrame, limit: int | None) -> pl.DataFrame:
+    """Deterministic selection of candidate rows.
+
+    Sorts by ``impression_row_id`` (never parquet row order) before applying a
+    ``--limit``, so the same N smallest-``impression_row_id`` rows are always
+    selected. Validation is applied by the caller afterwards."""
+    cand = cand.sort(IMPRESSION_ROW_ID)
+    if limit is not None:
+        cand = cand.head(limit)
+    return cand
+
+
 def run_eval(
     cfg: dict,
     datasets: list[str],
@@ -305,12 +388,6 @@ def run_eval(
     ev_cfg = cfg.get("evaluation", {})
     bootstrap_runs = int(ev_cfg.get("bootstrap_runs", 1000))
     seed = int(ev_cfg.get("bootstrap_seed", 42))
-    top_k = (
-        [int(k) for k in cfg["retrieval"]["bm25"].get("top_k", [50, 100, 200])]
-        if "retrieval" in cfg
-        else [50, 100, 200]
-    )
-    top_k_beyond = max(top_k) if top_k else 200
 
     base = processed_dir(cfg)
     results: dict[str, Any] = {}
@@ -325,17 +402,33 @@ def run_eval(
 
         for split in splits:
             discovered = _discover_methods(dset_dir, split)
+            if not discovered:
+                raise ValueError(
+                    f"no candidate files discovered for dataset '{dataset}' split '{split}'"
+                )
+            evaluated = []
             for method_name, emb, cand_path in discovered:
                 if methods_filter and method_name not in methods_filter:
                     continue
                 if embedding_override and emb is not None and emb != embedding_override:
                     continue
-                if emb is None and embedding_override:
-                    # bm25 cannot be restricted by embedding; keep bm25 always
-                    pass
+                # bm25 (emb is None) is never filtered by an embedding override
+                evaluated.append((method_name, emb, cand_path))
+            if methods_filter:
+                available = {m for m, _, _ in discovered}
+                missing = [m for m in methods_filter if m not in available]
+                if missing:
+                    raise ValueError(
+                        f"requested methods not found for {dataset}/{split}: {missing}"
+                    )
+            if not evaluated:
+                raise ValueError(
+                    f"no candidate methods to evaluate for {dataset}/{split} "
+                    f"after filters"
+                )
+            for method_name, emb, cand_path in evaluated:
                 cand = read_df(cand_path)
-                if limit is not None:
-                    cand = cand.head(limit)
+                cand = _select_candidate_rows(cand, limit)
                 log.info("%s/%s/%s: evaluating %d rows", dataset, split, method_name, cand.height)
                 res = evaluate_candidates(
                     cand,
@@ -347,7 +440,6 @@ def run_eval(
                     bootstrap_runs,
                     seed,
                     split,
-                    top_k_beyond,
                 )
                 out_dir = dset_dir / "retrieval" / "eval"
                 out_dir.mkdir(parents=True, exist_ok=True)
