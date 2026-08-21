@@ -372,7 +372,8 @@ def _select_candidate_rows(cand: pl.DataFrame, limit: int | None) -> pl.DataFram
 
     Sorts by ``impression_row_id`` (never parquet row order) before applying a
     ``--limit``, so the same N smallest-``impression_row_id`` rows are always
-    selected. Validation is applied by the caller afterwards."""
+    selected. When ``limit`` is set, only these first N rows are evaluated AND
+    validated (a smoke-test limit; the full run is unaffected when unset)."""
     cand = cand.sort(IMPRESSION_ROW_ID)
     if limit is not None:
         cand = cand.head(limit)
@@ -487,7 +488,11 @@ def main() -> None:
     parser.add_argument(
         "--methods", default=None, help="comma-separated methods (e.g. bm25,semantic_word2vec)"
     )
-    parser.add_argument("--limit", type=int, default=None, help="cap impressions (debug)")
+    parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Evaluate and validate only the first N rows after deterministic "
+             "sorting by impression_row_id (smoke-test limit; omit for full run).",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(
