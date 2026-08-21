@@ -1,6 +1,6 @@
 # AGENTS.md
 
-IRE Assignment 1: lexical (BM25) + semantic (embedding/ANN) retrieval pipeline on MIND (English) and EB-NeRD (Danish). Spec: `Assignment1_v1.pdf`. Q1 (data pipeline), Q2 (BM25), and Q3 (semantic/embedding) are done; Q4–Q5 are pending.
+IRE Assignment 1: lexical (BM25) + semantic (embedding/ANN) retrieval pipeline on MIND (English) and EB-NeRD (Danish). Spec: `Assignment1_v1.pdf`. Q1 (data pipeline), Q2 (BM25), Q3 (semantic/embedding), Q4 (offline eval harness), and Q5 (Codabench prediction generation) are done.
 
 ## Environment (critical)
 
@@ -67,7 +67,7 @@ make test         # unit tests (synthetic data only, no raw files needed)
 - `tests/test_data_pipeline.py`: 18 tests, fully synthetic (no data/ needed), fast. Covers TSV parsing, labels, temporal split (day + fallback + identical-timestamp grouping), entity pooling, history causality/cap, unified history schema, cold-start `[]`, train-only popularity, per-stage config-signature/up-to-date cache invalidation, MIND/EB-NeRD embedding-output presence, and pipeline orchestration (rebuild-on-config-change + partial-rebuild-must-not-refresh-other-stages).
 - `tests/test_bm25.py`: 13 tests covering the BM25 index, zero-score top-K fill (deterministic tail, no dups, corpus < K), query-from-history capping (incl. cap=0/negative), recall@K, corpus field variants, and run_bm25 partial-run isolation from stale splits.
 - `tests/test_semantic.py`: 17 tests covering embedding load + validation (dim match, unique ids, ndim/dim>0/finite, catalog restriction), L2-normalize of a *copy* + FAISS cosine index, mean-pool of raw vectors (normalize on/off, zero-norm → `None`), cold-start `None`, result padding, partial-coverage gt filtering, row-level fair-comparison intersection (incl. duplicate impression_ids), run_semantic stale-run isolation, and an end-to-end run_semantic on a synthetic store (embeddings → index → history → user vec → FAISS → recall@K) that distinguishes raw from normalized pooling.
-- `make lexical` and `make semantic` (Q2/Q3) both work; `eval`/`predict` (Q4/Q5) still pending; don't run them.
+- `make lexical`, `make semantic` (Q2/Q3), `make eval` (Q4), and `make predict` (Q5) all work. Q5 (`src/ire_rec/make_predictions.py`) fuses normalized BM25 + semantic scores per impression and writes competition-format files under `predictions/<DS>/` (MIND: TSV no header; EB-NeRD: CSV with header). **Caveat:** the MIND test split has 13,921 duplicate `impression_id` values across distinct rows (see retrieval dev-quirk note) — `make predict` emits one line per impression row, so the MIND prediction file contains duplicate impression_id lines; verify against the Codabench test impression set before submitting.
 
 ## Git
 
