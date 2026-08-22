@@ -97,15 +97,33 @@ def novelty_for_ids(ids: list[str], p_lookup: dict[str, float]) -> float:
     return float(np.mean(vals))
 
 
-def bootstrap_mean_ci(values, bootstrap_runs: int, seed: int) -> dict:
-    """Bootstrap 95% CI for the mean of per-impression metric values."""
+def bootstrap_mean_ci(values, bootstrap_runs: int, seed: int, chunk_size: int = 100) -> dict:
+    """Bootstrap 95% CI for the mean of per-impression metric values.
+
+    Bootstrap sample means are computed in CHUNKS of ``chunk_size`` runs rather
+    than by allocating the full ``(bootstrap_runs, n)`` index matrix at once.
+    This keeps memory bounded at ~``chunk_size * n`` int64 + float64 instead of
+    ``bootstrap_runs * n``, which matters at MIND/EB-NeRD scale (n in the
+    hundreds of thousands, ~15-20 such allocations per dataset/split/method).
+
+    The RNG is the same ``np.random.default_rng(seed)`` and the integer indices
+    are drawn in the same sequential order as a single full ``size=(runs, n)``
+    call, so results are bit-for-bit identical to the unchunked implementation.
+    """
     values = np.asarray(values, dtype=float)
     if values.size == 0:
         return {"value": None, "ci_low": None, "ci_high": None}
     rng = np.random.default_rng(seed)
     n = values.size
-    idx = rng.integers(0, n, size=(bootstrap_runs, n))
-    sample_means = values[idx].mean(axis=1)
+    sample_means = np.empty(bootstrap_runs, dtype=float)
+    offset = 0
+    remaining = bootstrap_runs
+    while remaining > 0:
+        chunk = min(chunk_size, remaining)
+        idx = rng.integers(0, n, size=(chunk, n))
+        sample_means[offset : offset + chunk] = values[idx].mean(axis=1)
+        offset += chunk
+        remaining -= chunk
     lo = float(np.percentile(sample_means, 2.5))
     hi = float(np.percentile(sample_means, 97.5))
     return {"value": float(values.mean()), "ci_low": lo, "ci_high": hi}

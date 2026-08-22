@@ -154,8 +154,14 @@ def _determine_ranking(inview, labels, cand_ids, cand_scores):
     """Deterministic INVIEW ranking (spec section 4).
 
     Returns (scores_arr aligned with inview, ranked_labels) where ranked_labels
-    is ``labels`` ordered by (-score, retrieved?, retrieval_rank, inview_pos).
-    Unretrieved inview articles get score 0.0 and retrieval_rank = +inf.
+    is ``labels`` ordered by (retrieved_flag, -score_if_retrieved,
+    retrieval_rank, inview_pos). ``retrieved_flag`` is 0 for retrieved and 1 for
+    unretrieved, so retrieved articles ALWAYS outrank unretrieved ones
+    regardless of score sign (a clicked article retrieved with a negative
+    cosine score must not sort below unretrieved articles). Among retrieved
+    articles, -score orders them (more-negative score => worse rank). Unretrieved
+    articles keep retrieval_rank = +inf and are ordered among themselves by
+    inview_pos (their relative order is irrelevant to ranking metrics).
     """
     score_map: dict[str, tuple[float, int]] = {}
     for r, cid in enumerate(cand_ids):
@@ -166,10 +172,10 @@ def _determine_ranking(inview, labels, cand_ids, cand_scores):
         lab = int(labels[p])
         if a in score_map:
             s, rr = score_map[a]
-            entries.append((-s, 0, rr, p, lab))
+            entries.append((0, -s, rr, p, lab))
             scores_arr.append(s)
         else:
-            entries.append((0.0, 1, float("inf"), p, lab))
+            entries.append((1, 0.0, float("inf"), p, lab))
             scores_arr.append(0.0)
     entries.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
     ranked_labels = [e[4] for e in entries]

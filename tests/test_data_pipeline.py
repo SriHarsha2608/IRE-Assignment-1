@@ -428,6 +428,27 @@ def test_up_to_date_embeddings_requires_ids_parquets(tmp_path):
         (base / f).write_bytes(b"x")
 
 
+def test_fingerprint_content_based_not_mtime(tmp_path):
+    import ire_rec.download as dl
+
+    d = tmp_path / "f.zip"
+    d.write_bytes(b"identical content here")
+    fp1 = dl.fingerprint(d)
+    # Changing only mtime must NOT change the fingerprint (no spurious rebuild).
+    old = d.stat().st_mtime
+    try:
+        d.touch()
+    except OSError:
+        pass
+    fp2 = dl.fingerprint(d)
+    assert fp1 == fp2
+    assert fp1["sha256"] == fp2["sha256"]
+    # Different content must produce a different fingerprint.
+    d.write_bytes(b"different content here")
+    fp3 = dl.fingerprint(d)
+    assert fp3["sha256"] != fp1["sha256"]
+
+
 def test_pipeline_orchestration_config_change_triggers_rebuild(monkeypatch, tmp_path):
     import sys
 

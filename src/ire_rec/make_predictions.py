@@ -2,13 +2,20 @@
 
 For every requested dataset we rank each *test*-split impression's ``inview``
 articles by a normalized fusion of the BM25 and semantic candidate scores, then
-write the prediction in the format expected by each competition:
+write the prediction in the format expected by each competition. Both
+competitions require a **rank permutation** over the impression's ``inview``
+list: for each impression we emit the 1-based rank of every article in the
+order those articles appear in ``inview`` (NOT a reordered id list). E.g. if
+``inview == [A, B, C]`` and our ranking puts B first, C second, A third, the
+line for that impression is ``[3,1,2]``.
+
+Output formats:
 
   * MIND (Codabench 13967): TSV, **no header**, one line per impression:
-    ``<impression_id><TAB><a1> <a2> ... <aN>`` where the article ids are the
-    full inview set ordered by predicted click likelihood (descending).
+    ``<impression_id><TAB>[<rank_1>,<rank_2>,...,<rank_n>]``.
   * EB-NeRD / RecSys 2024 (Codabench 2469): CSV with header
-    ``impression_id,prediction`` and the same space-separated ranked list.
+    ``impression_id,prediction`` where prediction is the same
+    ``[<rank_1>,<rank_2>,...]`` rank-permutation string.
 
 The fusion normalizes each method's raw scores to [0, 1] (per impression,
 min-max) so the two retrieval signals are comparable despite different scales;
@@ -75,9 +82,16 @@ def _component(present: dict[str, float], inview: list[str], default: float = -1
     return {a: norm.get(a, default) for a in inview}
 
 
-def _rank_inview(inview: list[str], fused: list[float]) -> list[str]:
+def _rank_inview(inview: list[str], fused: list[float]) -> list[int]:
+    """Return the 1-based rank of each inview article by ``fused`` score
+    (rank 1 = highest score), aligned with ``inview`` order. Competitions
+    require a rank permutation over the inview list, not a reordered id list.
+    Ties are broken by the original inview order for determinism."""
     order = sorted(range(len(inview)), key=lambda i: (-fused[i], i))
-    return [inview[i] for i in order]
+    ranks = [0] * len(inview)
+    for rank, idx in enumerate(order, start=1):
+        ranks[idx] = rank
+    return ranks
 
 
 def _fuse_row(inview, bm25_c, bm25_s, sem_c, sem_s, w_bm25, w_sem) -> list[str]:
@@ -102,13 +116,15 @@ def _fmt_for(dataset: str) -> str:
     return "mind" if dataset.startswith("MIND") else "ebnerd"
 
 
-def _write_predictions(out_file: Path, rows: list[tuple[str, list[str]]], fmt: str) -> None:
+def _write_predictions(out_file: Path, rows: list[tuple[str, list[int]]], fmt: str) -> None:
     out_file.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "mind":
-        text = "\n".join(f"{iid}\t{' '.join(ranked)}" for iid, ranked in rows)
+        text = "\n".join(
+            f"{iid}\t[{','.join(str(r) for r in ranks)}]" for iid, ranks in rows
+        )
     else:  # ebnerd: CSV with header
         text = "impression_id,prediction\n" + "\n".join(
-            f"{iid},{' '.join(ranked)}" for iid, ranked in rows
+            f"{iid},[{','.join(str(r) for r in ranks)}]" for iid, ranks in rows
         )
     out_file.write_text(text + "\n")
 
@@ -172,22 +188,22 @@ def make_predictions_for_dataset(
             lambda r: _fuse_row(
                 r[INVIEW], r[BM25_C], r[BM25_S], r[SEM_C], r[SEM_S], w_bm25, w_sem
             ),
-            return_dtype=pl.List(pl.String),
+            return_dtype=pl.List(pl.Int64),
         ).alias(RANKED)
     )
 
-    rows: list[tuple[str, list[str]]] = []
+    rows: list[tuple[str, list[int]]] = []
     dup_ids = 0
     seen_ids: set[str] = set()
     for row in ranked.iter_rows(named=True):
-        ranked_ids = row[RANKED] or []
-        if not ranked_ids:
+        ranks = row[RANKED] or []
+        if not ranks:
             continue
         iid = str(row[IMPRESSION_ID])
         if iid in seen_ids:
             dup_ids += 1
         seen_ids.add(iid)
-        rows.append((iid, ranked_ids))
+        rows.append((iid, ranks))
 
     fmt = _fmt_for(dataset)
     out_root = out_root or (cfg_mod.repo_root() / "predictions")
@@ -249,12 +265,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--w-semantic", type=float, default=0.5, help="semantic fusion weight (default 0.5)")
     p.add_argument("--out", type=str, default=None,
                    help="output root dir for prediction files (default: <repo>/predictions)")
+    p.add_argument("-v", "--verbose", action="store_true")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> dict[str, Any]:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s __main__: %(message)s")
     args = _parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    config = cfg_mod.load_config(Path(args.config) if args.config else None)
     config = cfg_mod.load_config(Path(args.config) if args.config else None)
     datasets = args.datasets.split(",") if args.datasets else None
     out_root = Path(args.out) if args.out else None

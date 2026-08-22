@@ -293,6 +293,15 @@ def build_ebnerd_bundle(cfg: dict, bundle: str, force: bool, redownload: bool) -
         impressions_parts.append(imp)
         history_parts.append(hist)
 
+    # NOTE (Q8 / reviewer concern): each split-folder's impressions+history is
+    # parsed by a SEPARATE parse_ebnerd_behaviors call, so every impression's
+    # per-impression HISTORY list is computed from ONLY that folder's own
+    # history.parquet (see _compute_per_impression_history). The concat below
+    # only stacks finalized rows; histories are never recomputed across
+    # train/validation. Therefore a single impression's history list CANNOT
+    # contain a duplicate click traceable to the train/validation concat. The
+    # long-form history.parquet is just an artifact and is not read by retrieval
+    # (run_bm25/run_semantic use the HISTORY column on impressions.parquet).
     impressions = pl.concat(impressions_parts)
     impressions, boundaries = split.add_temporal_split(
         impressions,

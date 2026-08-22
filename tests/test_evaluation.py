@@ -166,6 +166,40 @@ def test_bootstrap_mean_ci_empty():
     }
 
 
+def _bootstrap_mean_ci_reference(values, bootstrap_runs, seed):
+    """Reference (unchunked, full-index-matrix) implementation kept only to
+    prove the chunked version is bit-for-bit identical."""
+    values = np.asarray(values, dtype=float)
+    rng = np.random.default_rng(seed)
+    n = values.size
+    idx = rng.integers(0, n, size=(bootstrap_runs, n))
+    sample_means = values[idx].mean(axis=1)
+    return {
+        "value": float(values.mean()),
+        "ci_low": float(np.percentile(sample_means, 2.5)),
+        "ci_high": float(np.percentile(sample_means, 97.5)),
+    }
+
+
+def test_bootstrap_mean_ci_chunked_matches_reference():
+    # Moderate n; chunk that does NOT divide evenly to exercise the tail chunk.
+    rng = np.random.default_rng(7)
+    v = rng.uniform(0, 1, size=2000)
+    ref = _bootstrap_mean_ci_reference(v, 1000, 42)
+    # default chunk (100) and an uneven chunk (37) must both match exactly
+    for chunk in (100, 37, 1, 1000):
+        got = M.bootstrap_mean_ci(v, 1000, 42, chunk_size=chunk)
+        assert got == ref
+
+
+def test_bootstrap_mean_ci_chunked_reproducible():
+    v = np.arange(1, 501, dtype=float)
+    a = M.bootstrap_mean_ci(v, 500, 99, chunk_size=50)
+    b = M.bootstrap_mean_ci(v, 500, 99, chunk_size=50)
+    assert a == b
+    assert a["ci_low"] <= a["value"] <= a["ci_high"]
+
+
 def test_bootstrap_coverage_reproducible():
     sets = [{"a"}, {"b"}, {"c"}]
     a = M.bootstrap_coverage_ci(sets, 5, 200, 7)
@@ -207,6 +241,47 @@ def test_ranking_retrieved_ties_keep_retrieval_order():
     # y (status0, rank0) precedes x (status0, rank1)
     assert ranked == [0, 0]
     assert s_arr == [0.0, 0.0]
+
+
+def test_ranking_negative_score_retrieved_outranks_unretrieved():
+    # Regression for item 1: a clicked article retrieved with a NEGATIVE score
+    # must still rank ABOVE unretrieved articles (which previously got an
+    # artificial 0.0 and sorted ahead because -score was the primary key).
+    inview = ["A", "B", "C"]
+    labels = [1, 0, 0]
+    cands = ["A"]
+    scores = [-0.2]
+    s_arr, ranked = _determine_ranking(inview, labels, cands, scores)
+    assert ranked == [1, 0, 0]
+    # MRR for this impression must be 1.0 (click ranked first)
+    assert M.mrr_from_ranked(ranked) == pytest.approx(1.0)
+
+
+def test_ranking_two_negative_scores_ordered_by_magnitude():
+    # Both retrieved with negative scores: more-negative is worse (ranks later).
+    inview = ["A", "B", "C"]
+    labels = [1, 1, 0]
+    cands = ["A", "B"]
+    scores = [-0.5, -0.1]  # A worse than B
+    s_arr, ranked = _determine_ranking(inview, labels, cands, scores)
+    # A (more negative, -0.5) after B (less negative, -0.1); C unretrieved last.
+    # B (a click) ranks first -> the more-negative A is correctly ranked worse.
+    assert ranked == [1, 1, 0]
+    assert M.mrr_from_ranked(ranked) == pytest.approx(1.0)
+
+
+def test_ranking_mixed_positive_negative_retrieved():
+    # Mixed case: one positive and one negative retrieved score.
+    inview = ["A", "B", "C"]
+    labels = [1, 0, 1]
+    cands = ["A", "C"]
+    scores = [-0.3, 0.4]  # C positive > A negative
+    s_arr, ranked = _determine_ranking(inview, labels, cands, scores)
+    # C (0.4) ranks first, A (-0.3) second, B unretrieved last
+    assert ranked == [1, 1, 0]
+    assert M.mrr_from_ranked(ranked) == pytest.approx(1.0)
+    # scores_arr stays aligned with inview order
+    assert s_arr == [-0.3, 0.0, 0.4]
 
 
 # ---------------------------------------------------------------------------
